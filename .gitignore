@@ -1,0 +1,30 @@
+# Game
+游戏/
+Game.exe
+
+# Build artifacts
+build/
+dist/
+output/
+*.spec
+
+# Runtime data
+elsmod_data/
+www/
+
+# Test files
+example/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+
+# Project
+CLAUDE.md
