@@ -846,6 +846,20 @@ class InstallerWizard(tk.Tk):
     def _install_thread(self, payload_dir, game_dir, q):
         try:
             import json as _json
+
+            # Pre-scan: walk the entire payload to build the manifest BEFORE copying.
+            # This way the uninstaller knows about every single file and directory.
+            installed = []
+            for root, dirs, files in os.walk(payload_dir):
+                for d in dirs:
+                    rel = os.path.relpath(os.path.join(root, d),
+                                          payload_dir).replace("\\", "/")
+                    installed.append(rel)
+                for f in files:
+                    rel = os.path.relpath(os.path.join(root, f),
+                                          payload_dir).replace("\\", "/")
+                    installed.append(rel)
+
             total = _count_files(payload_dir)
             cur = [0]
 
@@ -854,7 +868,6 @@ class InstallerWizard(tk.Tk):
                 cur[0] += 1
                 q.put(("progress", cur[0], total, os.path.basename(src)))
 
-            installed = []
             for item in os.listdir(payload_dir):
                 src = os.path.join(payload_dir, item)
                 dst = os.path.join(game_dir, item)
@@ -864,23 +877,52 @@ class InstallerWizard(tk.Tk):
                     shutil.copytree(src, dst, copy_function=_copy_with_progress)
                 else:
                     _copy_with_progress(src, dst)
-                installed.append(item)
 
-            # Write install manifest so uninstaller knows what to clean
+            # Write install manifest — single source of truth for uninstaller
             try:
                 manifest_dir = os.path.join(game_dir, "elsmod_data")
                 os.makedirs(manifest_dir, exist_ok=True)
-                manifest_path = os.path.join(manifest_dir, "install_manifest.json")
-                existing = []
-                if os.path.isfile(manifest_path):
-                    existing = _json.loads(
-                        open(manifest_path, "r", encoding="utf-8").read()
-                    ).get("items", [])
-                all_items = sorted(set(existing + installed))
+                manifest_path = os.path.join(manifest_dir,
+                                             "install_manifest.json")
                 with open(manifest_path, "w", encoding="utf-8") as f:
-                    _json.dump({"items": all_items}, f, ensure_ascii=False, indent=2)
+                    _json.dump({"items": sorted(installed)}, f,
+                              ensure_ascii=False, indent=2)
             except Exception:
                 pass  # non-critical
+
+            # Register .elsmod file association to the installed injector
+            try:
+                import ctypes
+                import winreg
+                ELSMOD_PROGID = "ElushaPlugin.elsmod"
+                exe_path = os.path.join(game_dir, "ElushaInjector.exe")
+                if os.path.isfile(exe_path):
+                    # Remove UserChoice hash (Windows 8+) that blocks the
+                    # association when user previously set a default app.
+                    try:
+                        uc_key = winreg.OpenKey(
+                            winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.elsmod",
+                            0, winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE)
+                        try:
+                            winreg.DeleteValue(uc_key, "UserChoice")
+                        except FileNotFoundError:
+                            pass
+                        winreg.CloseKey(uc_key)
+                    except FileNotFoundError:
+                        pass
+                    with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                                          r"Software\Classes\.elsmod") as k:
+                        winreg.SetValue(k, "", winreg.REG_SZ, ELSMOD_PROGID)
+                    with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                                          rf"Software\Classes\{ELSMOD_PROGID}\DefaultIcon") as k:
+                        winreg.SetValue(k, "", winreg.REG_SZ, f'"{exe_path}",0')
+                    with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                                          rf"Software\Classes\{ELSMOD_PROGID}\shell\open\command") as k:
+                        winreg.SetValue(k, "", winreg.REG_SZ, f'"{exe_path}" "%1"')
+                    ctypes.windll.shell32.SHChangeNotify(0x08000000, 0, None, None)
+            except Exception:
+                pass  # non-critical, injector will auto-register on startup
 
             q.put(("done", installed))
         except Exception as exc:

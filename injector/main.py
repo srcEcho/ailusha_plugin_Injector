@@ -27,10 +27,14 @@ def main():
         from injector.core import cli_engine
         try:
             cli_engine.cmd_install(sys.argv[1])
-        except Exception as e:
+        except BaseException as e:
             import tkinter.messagebox as mb
             mb.showerror("导入失败", str(e))
-        # Fall through to GUI
+            # If game dir detection failed, still launch GUI so user sees the error
+            from injector.gui.main_window_pyside6 import run as gui_run
+            gui_run()
+            return
+        # Fall through to GUI (install succeeded, show the updated plugin list)
         from injector.gui.main_window_pyside6 import run as gui_run
         gui_run()
         return

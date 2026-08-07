@@ -10,14 +10,25 @@ from . import registry, elsmod, installer, deploy, dependency
 
 
 def _game_dir() -> str:
-    """Detect game directory. Tries: argv[0] path (PyInstaller safe) → CWD."""
-    # PyInstaller --onefile: sys.executable → TEMP, sys.argv[0] → actual exe path
-    d = os.path.dirname(os.path.abspath(sys.argv[0]))
-    if not deploy.is_game_directory(d):
-        d = os.getcwd()
-    if not deploy.is_game_directory(d):
-        raise SystemExit("错误：当前目录不包含 Game.exe。请将程序放到游戏目录下运行。")
-    return d
+    """Detect game directory. Tries: argv[0] path, executable dir, then CWD."""
+    # First try: directory of the running executable
+    # PyInstaller onefile: sys.executable is in TEMP, use sys.argv[0]
+    # Nuitka standalone: sys.executable IS the actual EXE — always reliable
+    if getattr(sys, 'frozen', False):
+        if hasattr(sys, '_MEIPASS'):
+            d = os.path.dirname(os.path.abspath(sys.argv[0]))
+        else:
+            d = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        d = os.path.dirname(os.path.abspath(sys.argv[0]))
+
+    # Fallbacks: CWD, then parent of executable dir
+    for candidate in [d, os.getcwd(),
+                      os.path.dirname(os.path.abspath(sys.argv[0]))]:
+        if deploy.is_game_directory(candidate):
+            return candidate
+
+    raise SystemExit("错误：当前目录不包含 Game.exe。请将程序放到游戏目录下运行。")
 
 
 def cmd_setup(game_dir: Optional[str] = None) -> dict:
