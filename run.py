@@ -7,7 +7,10 @@ import sys
 import os
 
 # Ensure project root is in path
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+try:
+    PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    PROJECT_ROOT = os.path.dirname(os.path.abspath(sys.executable))
 sys.path.insert(0, PROJECT_ROOT)
 
 from injector.main import main

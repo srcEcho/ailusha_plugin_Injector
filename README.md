@@ -8,11 +8,10 @@
 
 ### 安装
 
-1. 将 `ElushaInjector.exe` 放到游戏目录（和 `Game.exe` 同级）
-2. 双击 `ElushaInjector.exe` 启动注入器
-3. **直接双击 `Game.exe` 即可加载插件**
-
-首次启动会自动创建必要目录并注册 `.elsmod` 文件关联。
+1. 下载 `ElushaInstaller.exe`（约 50MB，唯一需要的文件）
+2. 双击运行 → 多页面向导：选择语言 → 选择游戏程序（`Game.exe` / `nw.exe` / 其他）→ 确认安装信息
+3. 点击「安装」→ 进度条显示复制进度 → 注入器释放到游戏目录
+4. 安装完成后可选择删除安装器
 
 ### 管理插件
 
@@ -23,11 +22,21 @@
 | 调整顺序 | 上下拖拽插件条目 |
 | 查看详情 | 双击插件条目 |
 | 卸载插件 | 详情页点击「卸载插件」 |
-| 启动游戏 | 点击「启动游戏」或直接双击 `Game.exe` |
+| 启动游戏 | 在「启动游戏」旁的下拉框选择要启动的 exe，点击启动 |
+
+游戏程序名称可能因解包方式不同而异（`Game.exe`、`nw.exe` 等）。注入器启动按钮旁的**下拉框**会自动检测当前目录下所有 exe，选择一个即可。
+
+### 破损插件修复
+
+如果插件文件意外丢失，注入器会自动检测并标记为破损（红色描边）。点击「修复」按钮即可从源文件恢复。如果 `.elsmod` 源文件也丢失了但有残留文件，修复会重新扫描并更新注册表。
 
 ### 卸载注入器
 
-双击 `UninstallElusha.exe`（注入器首次运行时自动生成）。可选择保留插件文件。
+双击游戏目录下的 `UninstallElusha.exe`。可选择：
+- 保留已下载的插件（保留 `elsmod_data/`）
+- 保留已加载的插件（保留 `www/js/plugins/`）
+
+卸载器会删除所有注入器文件（EXE、DLL、pyd、运行库目录）、`version.dll`、`ElushaInstaller.exe` 及 bootstrap 文件。自身进程锁定的文件通过延迟批处理在退出后清理。
 
 ---
 
@@ -111,7 +120,7 @@ ElushaInjector.exe --cli unpack MyPlugin.elsmod -o ./extracted
 ElushaInjector.exe --dev
 ```
 
-提供打包、解包、模板生成、终端、工具链接。
+提供打包、解包、模板生成、终端、工具链接、孤立启动。
 
 ---
 
@@ -130,11 +139,11 @@ ElushaInjector.exe --dev
 │  安装 · 卸载 · 启用 · 依赖    │
 │  打包 · 解包 · 模板 · 部署    │
 └──────────┬───────────────────┘
-           │ 同步 enabled_plugins.txt
+           │ 同步 enabled_plugins.txt + registry.json
 ┌──────────▼───────────────────┐
 │  version.dll (C)             │  ← 注入核心
-│  Hook ReadFile → main.js     │
-│  动态注入 $plugins.push()    │
+│  MinHook: CreateFileW 重定向  │
+│  Bootstrap: fs+eval 加载插件  │
 └──────────────────────────────┘
 ```
 
@@ -143,26 +152,21 @@ ElushaInjector.exe --dev
 ```
 Game.exe 启动
   → Enigma 加载 version.dll
-  → DllMain: Hook kernel32!ReadFile
-  → NW.js 读取 main.js (270B)
-  → Hook 拦截 → 读取 elsmod_data/enabled_plugins.txt
-  → 为每个启用的插件生成 $plugins.push({"name":"XXX",...})
-  → 插入到 PluginManager.setup($plugins) 之前
-  → NW.js 拿到修改后的 main.js → V8 正常执行
-
-Enigma VFS fallback:
-  PluginManager.loadScript("js/plugins/XXX.js")
-  → Enigma 查 VFS → 不存在
-  → 自动 fallback 到磁盘 www/js/plugins/XXX.js
-  → 找到！加载执行
+  → DllMain: MinHook Hook CreateFileW + ReadFile
+  → 读取 elsmod_data/injector_config.json
+  → CreateFileW 重定向：目标 JS → Bootstrap
+  → Bootstrap 执行:
+    ① fs.readFileSync(原版文件) → eval (原版照跑)
+    ② fs.readFileSync(www/js/plugins/PluginA.js) → eval (MOD 加载)
 ```
 
 ### 关键设计决策
 
 - **version.dll 不代理 version API**：导出返回 0。不需要版本信息，避免残留进程
-- **一个 DLL + 一个文本文件**：不需要共享内存，不需要 IPC，不需要 injector.exe
-- **Enigma VFS fallback**：利用了 Enigma 在 VFS 中找不到文件时自动查磁盘的行为
-- **双击 Game.exe 就能用**：不需要 launcher，不需要 bat
+- **Bootstrap = CreateFileW 重定向 + fs+eval**：小型加载器（<250B）替换目标 JS，原版放 `originals/` 备份
+- **MinHook 永久 trampoline**：消除 P5/U5 与 Enigma Hook 的竞态，100% 可靠
+- **一键安装**：`ElushaInstaller.exe` 多页向导，选游戏目录即可部署
+- **混合打包**：Nuitka 编译游戏目录组件（避免 EnigmaVB 检测），PyInstaller 打包安装器（成熟稳定）
 
 ### 技术栈
 
@@ -170,28 +174,56 @@ Enigma VFS fallback:
 |----|------|
 | GUI | PySide6 (Qt), 19 个主题, 3 语言 |
 | 引擎 | Python 3.10, argparse CLI |
-| 注入 | C (MinGW GCC 32-bit), Win32 API Hook |
-| 打包 | PyInstaller (onefile, windowed) |
+| 注入 | C (MinGW GCC 32-bit), MinHook 1.3.3 |
+| 打包 | Nuitka standalone（游戏目录组件）, PyInstaller onefile（安装器） |
 
 ### 目录结构
 
 ```
 游戏目录/
-├── Game.exe                     ← 游戏本体
-├── ElushaInjector.exe           ← 注入器
-├── UninstallElusha.exe          ← 卸载器
-├── version.dll                  ← 注入 DLL
-├── elsmod_data/                 ← 插件存储 + 注册表
-│   ├── registry.json            ← 导入记录
+├── Game.exe                     ← 游戏本体（名称可能不同）
+├── ElushaInstaller.exe          ← 安装器（可选保留）
+├── ElushaInjector.exe           ← 注入器 GUI（Nuitka standalone）
+├── UninstallElusha.exe          ← 卸载器（Nuitka standalone, tkinter）
+├── python310.dll                ← Nuitka 运行时（散落文件）
+├── *.pyd / *.dll                ← Nuitka 运行时模块
+├── PySide6/ shiboken6/          ← Qt 库目录
+├── tcl/ tk/ tcl8/               ← Tcl/Tk 运行时（卸载器依赖）
+├── injector/                    ← 嵌入资源（图标等）
+├── version.dll                  ← 注入 DLL（MinHook）
+├── elsmod_data/                 ← 插件存储 + 注册表 + 配置
+│   ├── registry.json            ← 注册表
+│   ├── injector_config.json     ← 注入策略配置
+│   ├── ui_config.json           ← GUI 配置（语言、主题、选中 exe）
 │   └── *.elsmod                 ← 插件源文件
 └── www/js/plugins/              ← 已安装插件
 ```
+> Nuitka 采用 flat 布局（所有 DLL/pyd 与 EXE 同级），区别于 PyInstaller 的 `_internal/` 集中模式。
 
 ### 编译 version.dll
 
 ```bash
-gcc -shared -s -Os -static -Wl,--kill-at \
-  -o version.dll version_proxy_v46.c -lkernel32
+mkdir -p /c/tmp/mh_build/hde
+cp src/minhook/*.h /c/tmp/mh_build/
+cp src/minhook/*.c /c/tmp/mh_build/
+cp src/minhook/hde32.c src/minhook/hde32.h src/minhook/pstdint.h src/minhook/table32.h /c/tmp/mh_build/hde/
+cp src/mainline/version_proxy_v54_production.c /c/tmp/mh_build/v54.c
+/c/Programs/msys64/msys2_shell.cmd -mingw32 -defterm -no-start -c \
+  'cd /c/tmp/mh_build && gcc -shared -s -Os -static -Wl,--kill-at -I. -Ihde -o v54.dll v54.c buffer.c hook.c trampoline.c hde/hde32.c -lkernel32'
+cp /c/tmp/mh_build/v54.dll 游戏目录/version.dll
 ```
 
 必须通过 MSYS2 MinGW 32-bit shell 编译。
+
+### 完整构建
+
+```bash
+python build.py
+# Step 1: UninstallElusha.exe (Nuitka standalone + tk-inter)
+# Step 2: ElushaInjector/ (Nuitka standalone + pyside6)
+# Step 3: ElushaInstaller.exe (PyInstaller onefile, 内含 ElushaInjector/)
+```
+
+---
+
+[github.com/srcEcho/ailusha_plugin_Injector](https://github.com/srcEcho/ailusha_plugin_Injector)

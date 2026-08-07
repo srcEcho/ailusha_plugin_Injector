@@ -188,3 +188,23 @@ V8InspectorClient vtable                → 0x142A58C0 (27项)
 - **找到正确的 API**：kernel32 ReadFile/CreateFileW（文件 I/O 必经之路）
 - **找到正确的文件**：main.js（270B、位置关键、buffer 有充足空间）
 - **利用 Enigma 盲区**：非 www/ 路径透传到磁盘
+
+## 八、Hook 竞态问题（2026-08-07 诊断）
+
+### 双重 Hook 冲突
+Enigma 和我们的 DLL 都 hook 了 `kernel32!ReadFile`。在 Windows 上，多个 hook 通过以下链工作：
+```
+调用者 → kernel32!ReadFile (JMP→Hook2) → Hook2Handler
+  → 恢复 Hook1的JMP → 调用 ReadFile 地址 → 执行 Hook1 逻辑
+  → 恢复原始字节 → 调用原始 ReadFile
+  → 执行完后逐层恢复 JMP
+```
+
+我们的 P5/U5 方法在每次调用中恢复"DllMain 时保存的字节"（gO_RF），然后调用 ReadFile 地址。问题：**gO_RF 可能不包含 Enigma 的 hook**（如果 Enigma 在 DllMain 之后才 hook）。恢复 gO_RF 时，Enigma 的 hook 被临时移除。如果另一个线程在我们 unhook 期间调用 ReadFile → 绕过 Enigma VFS → 0xC0000005。
+
+### MinHook 方案
+MinHook 库（`MH_CreateHookApi`）创建永久 trampoline——从不 unhook。调用方始终走完整 hook 链：Caller → Enigma → 我们的 hook → Trampoline → 原始 ReadFile。零竞态。v50 已实现。
+
+### 已否决：NtReadFile 路线
+- NtReadFile hook 只能看到 Enigma 读自身的容器 PE 数据，看不到 JS 明文流量
+- 因为 Enigma 在 kernel32 ReadFile 层处理 VFS 文件并直接返回，不到达 ntdll

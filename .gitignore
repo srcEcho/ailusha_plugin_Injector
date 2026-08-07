@@ -5,8 +5,11 @@ Game.exe
 # Build artifacts
 build/
 dist/
+dist_nuitka/
 output/
 *.spec
+version.dll
+pyoxidizer.bzl
 
 # Runtime data
 elsmod_data/
@@ -26,5 +29,9 @@ __pycache__/
 .vscode/
 .idea/
 
-# Project
+# AI assistants
 CLAUDE.md
+.claude/
+
+# Dev utilities
+_check_keys.py

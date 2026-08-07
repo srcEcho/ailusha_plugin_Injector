@@ -1,5 +1,6 @@
 """.elsmod file association — Windows registry (HKCU, no admin required)"""
 import ctypes
+import os
 import sys
 import winreg
 
@@ -9,7 +10,8 @@ ELSMOD_PROGID = "ElushaPlugin.elsmod"
 
 def register():
     """Register .elsmod → ElushaInjector.exe association."""
-    exe_path = sys.executable
+    # PyInstaller --onefile: sys.argv[0] = real exe path, sys.executable = TEMP
+    exe_path = os.path.abspath(sys.argv[0]) if getattr(sys, 'frozen', False) else os.path.abspath(sys.executable)
 
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
                           r"Software\Classes\.elsmod") as k:

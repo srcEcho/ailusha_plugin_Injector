@@ -1,24 +1,97 @@
-"""Environment deployment — directory creation, file extraction"""
+"""Environment deployment — directory creation, file extraction, bootstrap generation"""
 import os
 import shutil
 import sys
+from . import injector_config
 
 REQUIRED_DIRS = [
     "www/js/plugins",
     "www/js/plugins/data",
     "elsmod_data",
     "elsmod_data/tmp",
+    "elsmod_data/originals/www/js/plugins",
+    "elsmod_data/bootstraps",
 ]
 
-EMBEDDED_FILES = [
-    "version.dll",
-    "UninstallElusha.exe",
-]
+BOOTSTRAP_TEMPLATE = """(function(){{var f=require('fs'),p=require('path'),b=process.cwd();
+eval(f.readFileSync(p.join(b,'elsmod_data/originals/www/js/plugins/{original}'),'utf8'));
+{loaders}
+}})();"""
+
+PLUGIN_LOADER = "eval(f.readFileSync(p.join(b,'{path}'),'utf8'));\n"
+
+EMBEDDED_FILES_PACKED = ["UninstallElusha.exe"]
+EMBEDDED_FILES_UNPACKED = ["UninstallElusha.exe"]
+
+
+def _extract_dll(game_dir: str) -> bool:
+    """Extract version.dll from embedded base64 data.
+    Respects injector_config.json for hook_library selection.
+    Returns True on success."""
+    dll_path = os.path.join(game_dir, "version.dll")
+
+    # Read config to determine which DLL variant to deploy
+    try:
+        from . import injector_config
+        cfg = injector_config.load(game_dir)
+        hook_lib = cfg.get("hook_library", "minhook")
+    except Exception:
+        hook_lib = "minhook"
+
+    # Build a version marker to detect config changes
+    marker_path = os.path.join(game_dir, "elsmod_data", ".dll_version")
+    current_marker = f"v={hook_lib}"
+    if os.path.exists(dll_path) and os.path.exists(marker_path):
+        try:
+            with open(marker_path, "r") as f:
+                if f.read().strip() == current_marker:
+                    return True  # Already present with correct variant
+        except Exception:
+            pass
+
+    # Extract the correct DLL variant
+    try:
+        import base64
+        from . import _dll_data
+        if hook_lib == "p5u5":
+            data = base64.b64decode("".join(_dll_data.VERSION_DLL_V46_B64))
+        else:
+            data = base64.b64decode("".join(_dll_data.VERSION_DLL_B64))
+        with open(dll_path, "wb") as f:
+            f.write(data)
+        with open(marker_path, "w") as f:
+            f.write(current_marker)
+        return True
+    except Exception:
+        return False
+
+
+def _has_unpacked_layout(path: str) -> bool:
+    """Check for NW.js unpacked layout: www/ with index.html + package.json + runtime DLLs."""
+    return (os.path.isdir(os.path.join(path, "www")) and
+            os.path.isfile(os.path.join(path, "www", "index.html")) and
+            os.path.isfile(os.path.join(path, "package.json")) and
+            any(os.path.isfile(os.path.join(path, d)) for d in ["nw.dll", "nw_elf.dll", "node.dll", "ffmpeg.dll"]))
 
 
 def is_game_directory(path: str) -> bool:
-    """Check if path contains Game.exe."""
-    return os.path.isfile(os.path.join(path, "Game.exe"))
+    """Check if path is a valid game directory (packed or unpacked)."""
+    if os.path.isfile(os.path.join(path, "Game.exe")):
+        return True
+    if _has_unpacked_layout(path):
+        return True
+    return False
+
+
+def game_mode(path: str) -> str:
+    """Return 'packed' or 'unpacked' based on directory layout.
+    Unpacked: has www/index.html + package.json + NW.js runtime DLLs.
+    Packed: has Game.exe (Enigma-packed, 1.4GB) but no NW.js layout."""
+    if _has_unpacked_layout(path):
+        return "unpacked"
+    if os.path.isfile(os.path.join(path, "Game.exe")):
+        return "packed"
+    return "unknown"
 
 
 def ensure_directories(game_dir: str) -> list[str]:
@@ -33,10 +106,11 @@ def ensure_directories(game_dir: str) -> list[str]:
 
 
 def extract_embedded_files(game_dir: str, resource_dir: str) -> list[str]:
-    """Extract embedded files (version.dll, UninstallElusha.exe) from resource dir.
-    resource_dir is where PyInstaller stores bundled files (sys._MEIPASS or __file__ dir)."""
+    """Extract embedded files from resource dir, based on game mode."""
     extracted = []
-    for fn in EMBEDDED_FILES:
+    mode = game_mode(game_dir)
+    files = EMBEDDED_FILES_PACKED if mode == "packed" else EMBEDDED_FILES_UNPACKED
+    for fn in files:
         dest = os.path.join(game_dir, fn)
         if os.path.exists(dest):
             continue
@@ -49,12 +123,94 @@ def extract_embedded_files(game_dir: str, resource_dir: str) -> list[str]:
 
 def get_resource_dir() -> str:
     """Get the directory containing bundled resources.
-    Works both in PyInstaller bundle and from source."""
+    Supports PyInstaller (_MEIPASS) and Nuitka (exe directory)."""
     if getattr(sys, 'frozen', False):
-        return sys._MEIPASS
-    else:
-        # Running from source — resources are in the project root
+        if hasattr(sys, '_MEIPASS'):
+            return sys._MEIPASS  # PyInstaller
+        return os.path.dirname(sys.executable)  # Nuitka standalone
+    # Running from source — resources are in the exe directory
+    try:
+        return os.path.dirname(os.path.abspath(sys.argv[0]))
+    except Exception:
         return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _ensure_originals(game_dir: str, config: dict) -> list[str]:
+    """Copy original game files to originals/ backup for bootstrap.
+    Tries unpacked game www/ first, then checks if already copied.
+    Returns list of copied paths."""
+    copied = []
+    redirects = config.get("redirects", [])
+    if not redirects:
+        return copied
+
+    originals_dir = os.path.join(game_dir, "elsmod_data", "originals", "www", "js", "plugins")
+
+    for rule in redirects:
+        target_name = rule.get("target", "")
+        # Extract just the filename
+        filename = target_name.replace("\\", "/").split("/")[-1]
+        if not filename:
+            continue
+
+        dest = os.path.join(originals_dir, filename)
+        if os.path.isfile(dest):
+            continue  # Already copied
+
+        # Try to find the original:
+        # 1. From unpacked game www/ in the same directory
+        # 2. From a sibling 解包/ directory
+        # 3. From project root www/ (for development)
+        sources = [
+            os.path.join(game_dir, "www", "js", "plugins", filename),
+            os.path.join(os.path.dirname(game_dir), "解包", "www", "js", "plugins", filename),
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "www", "js", "plugins", filename),  # project root www/
+        ]
+        for src in sources:
+            if os.path.isfile(src):
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.copy2(src, dest)
+                copied.append(dest)
+                break
+
+    return copied
+
+
+def _generate_bootstraps(game_dir: str, config: dict, plugin_files: dict[str, str]) -> list[str]:
+    """Generate bootstrap JS files from redirect config.
+    plugin_files: {plugin_name: relative_path_to_js_file, ...}
+    Returns list of bootstrap paths created."""
+    created = []
+    redirects = config.get("redirects", [])
+    plugins = config.get("plugins", [])
+    if not redirects:
+        return created
+
+    for rule in redirects:
+        target_name = rule.get("target", "")
+        source_name = rule.get("source", "")
+        if not target_name or not source_name:
+            continue
+
+        # Extract original filename (e.g., "EventInformation.js")
+        original = target_name.replace("\\", "/").split("/")[-1]
+
+        # Build plugin loaders
+        loaders = ""
+        for pname in plugins:
+            path = plugin_files.get(pname, f"www/js/plugins/{pname}.js")
+            loaders += PLUGIN_LOADER.format(path=path)
+
+        bootstrap_js = BOOTSTRAP_TEMPLATE.format(original=original, loaders=loaders)
+
+        dest = os.path.join(game_dir, "www/js/plugins", source_name)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write(bootstrap_js)
+        created.append(dest)
+
+    return created
 
 
 def setup(game_dir: str) -> dict:
@@ -73,9 +229,36 @@ def setup(game_dir: str) -> dict:
         return result
 
     result["is_game_dir"] = True
+    mode = game_mode(game_dir)
 
     # Create directories
     result["dirs_created"] = ensure_directories(game_dir)
+
+    # Extract version.dll from embedded base64 (packed mode only)
+    if mode == "packed":
+        if _extract_dll(game_dir):
+            result["files_extracted"].append(os.path.join(game_dir, "version.dll"))
+        else:
+            result["errors"].append("无法解出版本 DLL")
+
+        # Generate bootstrap files for bootstrap mode
+        try:
+            cfg = injector_config.load(game_dir)
+            if cfg.get("injection_mode") == "bootstrap" and cfg.get("redirects"):
+                # Collect plugin file paths from registry
+                plugin_files = {}
+                try:
+                    reg = registry.load(game_dir)
+                    for rec in reg.get("records", []):
+                        if rec.get("enabled", False):
+                            name = rec["name"]
+                            plugin_files[name] = f"www/js/plugins/{name}.js"
+                except Exception:
+                    pass
+                bootstraps = _generate_bootstraps(game_dir, cfg, plugin_files)
+                result["files_extracted"].extend(bootstraps)
+        except Exception as e:
+            result["errors"].append(f"Bootstrap 生成失败：{e}")
 
     # Extract embedded files
     try:

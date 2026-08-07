@@ -70,10 +70,9 @@ def install(game_dir: str, elsmod_path: str) -> dict:
         if errors:
             raise ValueError("elsmod 格式错误：\n" + "\n".join(f"  - {e}" for e in errors))
 
-        # Check file conflicts for reinstall/upgrade
+        # Check file conflicts for reinstall/upgrade only
         reg = registry.load(game_dir)
         existing = registry.find_record(reg, name, author)
-        existing_files = set(existing["files"]) if existing else set()
 
         www_tmp = os.path.join(tmp_dir, "www", "js", "plugins")
         new_files = []
@@ -83,9 +82,12 @@ def install(game_dir: str, elsmod_path: str) -> dict:
                 rel = os.path.relpath(full, www_tmp)
                 new_files.append(rel)
 
+        # Only check conflicts when upgrading (existing record). First install = allow overwrite.
+        if existing:
+            existing_files = set(existing["files"])
+            for rel in new_files:
                 target = os.path.join(plugins_dir, rel)
                 if os.path.exists(target) and rel not in existing_files:
-                    # Cleanup before raising
                     shutil.rmtree(tmp_dir, ignore_errors=True)
                     raise ValueError(
                         f"文件冲突：'{rel}' 已存在且不是插件原始文件。\n"
@@ -118,10 +120,10 @@ def install(game_dir: str, elsmod_path: str) -> dict:
     # Phase 5: update registry
     reg = registry.load(game_dir)
     if existing:
-        registry.update_source(reg, name, source_name, version, new_files,
+        registry.update_source(reg, name, f"{ELSMOD_DATA}/{source_name}", version, new_files,
                                author=author)
     else:
-        registry.add_record(reg, name, author, version, source_name, new_files,
+        registry.add_record(reg, name, author, version, f"{ELSMOD_DATA}/{source_name}", new_files,
                             enabled=True)
 
     # Phase 6: topological sort
@@ -154,6 +156,8 @@ def uninstall(game_dir: str, name: str, author: Optional[str] = None) -> Optiona
 
     # Remove source elsmod
     source = rec.get("source", "")
+    if not source.startswith("elsmod_data/") and not source.startswith("elsmod_data\\"):
+        source = f"{ELSMOD_DATA}/{source}"
     source_path = _game_path(game_dir, source)
     if os.path.isfile(source_path):
         os.remove(source_path)
@@ -171,32 +175,53 @@ def uninstall(game_dir: str, name: str, author: Optional[str] = None) -> Optiona
 
 
 def repair(game_dir: str, name: str, author: Optional[str] = None) -> dict:
-    """Repair a broken plugin by re-extracting from elsmod_data."""
+    """Repair a broken plugin.
+
+    Strategy (in order):
+      1. If the .elsmod source exists in elsmod_data/ → re-extract files from it.
+      2. If the source is gone but some files still exist on disk → re-scan and
+         update the registry to match reality.
+      3. If neither source nor files exist → truly cannot repair.
+    """
     reg = registry.load(game_dir)
     rec = registry.find_record(reg, name, author)
     if not rec:
         raise ValueError(f"插件 '{name}' 未找到")
 
     source = rec.get("source", "")
+    # normalize: old registries stored just filename, new ones include elsmod_data/
+    if not source.startswith("elsmod_data/") and not source.startswith("elsmod_data\\"):
+        source = f"{ELSMOD_DATA}/{source}"
     source_path = _game_path(game_dir, source)
-    if not os.path.isfile(source_path):
-        raise FileNotFoundError(f"源文件 {source} 不存在，无法修复")
-
     plugins_dir = _game_path(game_dir, PLUGINS_DIR)
 
-    # Extract directly from elsmod
-    with __import__("zipfile").ZipFile(source_path, "r") as zf:
-        www_prefix = "www/js/plugins/"
-        for f in zf.namelist():
-            if f.startswith(www_prefix) and not f.endswith("/"):
-                rel = f[len(www_prefix):]
-                dst = os.path.join(plugins_dir, rel)
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                with zf.open(f) as src:
-                    with open(dst, "wb") as out:
-                        out.write(src.read())
+    # --- Path A: source .elsmod exists — re-extract ---
+    if os.path.isfile(source_path):
+        with __import__("zipfile").ZipFile(source_path, "r") as zf:
+            www_prefix = "www/js/plugins/"
+            for f in zf.namelist():
+                if f.startswith(www_prefix) and not f.endswith("/"):
+                    rel = f[len(www_prefix):]
+                    dst = os.path.join(plugins_dir, rel)
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    with zf.open(f) as src:
+                        with open(dst, "wb") as out:
+                            out.write(src.read())
+        return rec
 
-    return rec
+    # --- Path B: source gone — try to recover from existing files ---
+    surviving = []
+    for f in rec.get("files", []):
+        if os.path.isfile(os.path.join(plugins_dir, f)):
+            surviving.append(f)
+
+    if surviving:
+        rec["files"] = surviving
+        registry.save(game_dir, reg)
+        return rec
+
+    raise FileNotFoundError(
+        f"源文件 {source} 不存在，且插件文件已全部丢失，无法修复")
 
 
 def check_integrity(game_dir: str) -> list[dict]:

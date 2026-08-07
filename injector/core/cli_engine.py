@@ -10,8 +10,11 @@ from . import registry, elsmod, installer, deploy, dependency
 
 
 def _game_dir() -> str:
-    """Detect game directory. Raises SystemExit if not in game dir."""
-    d = os.getcwd()
+    """Detect game directory. Tries: argv[0] path (PyInstaller safe) → CWD."""
+    # PyInstaller --onefile: sys.executable → TEMP, sys.argv[0] → actual exe path
+    d = os.path.dirname(os.path.abspath(sys.argv[0]))
+    if not deploy.is_game_directory(d):
+        d = os.getcwd()
     if not deploy.is_game_directory(d):
         raise SystemExit("错误：当前目录不包含 Game.exe。请将程序放到游戏目录下运行。")
     return d
@@ -201,12 +204,63 @@ def cmd_imported() -> list[str]:
     return sorted([f for f in os.listdir(elsmod_dir) if f.endswith(".elsmod")])
 
 
-def cmd_pack(source_dir: str, output_path: str) -> dict:
-    """Pack a directory into an elsmod."""
-    if not os.path.isdir(source_dir):
-        raise FileNotFoundError(f"目录不存在：{source_dir}")
-    elsmod.pack(source_dir, output_path)
-    return {"packed": output_path}
+def cmd_pack(js_path: str, output_path: str = None) -> dict:
+    """Pack a plugin JS file (and its data dir) into an elsmod.
+    Auto-discovers data/<name>_<author>/ directory alongside the JS file."""
+    if not os.path.isfile(js_path):
+        raise FileNotFoundError(f"JS 文件不存在：{js_path}")
+    if not js_path.endswith(".js"):
+        raise ValueError("请选择 .js 插件文件")
+
+    plugins_dir = os.path.dirname(os.path.abspath(js_path))
+    js_name = os.path.splitext(os.path.basename(js_path))[0]
+    data_dir = os.path.join(plugins_dir, "data")
+
+    # Find matching data directory: data/<js_name>_<author>/
+    if not os.path.isdir(data_dir):
+        raise ValueError(f"data 目录不存在：{data_dir}")
+
+    candidates = []
+    for entry in os.listdir(data_dir):
+        full = os.path.join(data_dir, entry)
+        if os.path.isdir(full) and entry.startswith(js_name + "_"):
+            plugin_json = os.path.join(full, "plugin.json")
+            if os.path.isfile(plugin_json):
+                candidates.append((entry, full, plugin_json))
+
+    if not candidates:
+        raise ValueError(f"未找到匹配的 data 目录（data/{js_name}_<作者>/）")
+    if len(candidates) > 1:
+        names = [c[0] for c in candidates]
+        raise ValueError(f"找到多个匹配的 data 目录，请手动选择：{', '.join(names)}")
+
+    data_name, data_path, json_path = candidates[0]
+
+    # Validate plugin.json name matches
+    import json
+    with open(json_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    if meta.get("name") != js_name:
+        raise ValueError(f"plugin.json 中 name='{meta.get('name')}' 与 JS 文件名 '{js_name}.js' 不一致")
+
+    # Build temp structure and pack
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp()
+    try:
+        www_plugins = os.path.join(tmp, "www", "js", "plugins")
+        os.makedirs(www_plugins, exist_ok=True)
+        shutil.copy2(js_path, os.path.join(www_plugins, os.path.basename(js_path)))
+        dst_data = os.path.join(www_plugins, "data", data_name)
+        shutil.copytree(data_path, dst_data)
+
+        if not output_path:
+            ver = meta.get("version", "0.1.0")
+            output_path = os.path.join(os.path.dirname(js_path), f"{js_name}-{ver}.elsmod")
+        elsmod.pack(tmp, output_path)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    return {"packed": output_path, "name": js_name, "version": meta.get("version", "?")}
 
 
 def cmd_unpack(elsmod_path: str, output_dir: str) -> dict:
@@ -247,14 +301,70 @@ def cmd_template(name: str, author: str, target_dir: str) -> dict:
             "pluginJson": json_path, "pluginJs": js_path}
 
 
-def cmd_launch(skip_plugins: bool = False) -> dict:
-    """Launch Game.exe."""
+def cmd_move_up(name: str) -> dict:
+    """Move plugin up one position in loadOrder."""
     gd = _game_dir()
-    exe = os.path.join(gd, "Game.exe")
-    if not os.path.isfile(exe):
-        raise FileNotFoundError("Game.exe 不存在")
-    subprocess.Popen([exe], cwd=gd, creationflags=0x08000000)
-    return {"launched": True, "skipPlugins": skip_plugins}
+    reg = registry.load(gd)
+    lo = reg.get("loadOrder", [])
+    if name not in lo:
+        raise ValueError(f"插件 '{name}' 不在排序列表中")
+    i = lo.index(name)
+    if i > 0:
+        lo[i], lo[i - 1] = lo[i - 1], lo[i]
+        reg["loadOrder"] = lo
+        registry.save(gd, reg)
+    return {"name": name, "position": max(0, i - 1)}
+
+
+def cmd_move_down(name: str) -> dict:
+    """Move plugin down one position in loadOrder."""
+    gd = _game_dir()
+    reg = registry.load(gd)
+    lo = reg.get("loadOrder", [])
+    if name not in lo:
+        raise ValueError(f"插件 '{name}' 不在排序列表中")
+    i = lo.index(name)
+    if i < len(lo) - 1:
+        lo[i], lo[i + 1] = lo[i + 1], lo[i]
+        reg["loadOrder"] = lo
+        registry.save(gd, reg)
+    return {"name": name, "position": min(len(lo) - 1, i + 1)}
+
+
+def cmd_reorder(order: list[str]) -> dict:
+    """Set the entire loadOrder (from drag-drop)."""
+    gd = _game_dir()
+    reg = registry.load(gd)
+    reg["loadOrder"] = order
+    registry.save(gd, reg)
+    return {"loadOrder": order}
+
+
+def cmd_launch(skip_plugins: bool = False, exe_name: str = None) -> dict:
+    """Launch game. If exe_name is given, use it directly. Otherwise detect Game.exe/nw.exe."""
+    gd = _game_dir()
+    if exe_name:
+        exe = os.path.join(gd, exe_name)
+        if not os.path.isfile(exe):
+            raise FileNotFoundError(f"{exe_name} 不存在")
+        mode = "custom"
+    else:
+        mode = deploy.game_mode(gd)
+        if mode == "packed":
+            exe = os.path.join(gd, "Game.exe")
+            if not os.path.isfile(exe):
+                raise FileNotFoundError("Game.exe 不存在")
+        elif mode == "unpacked":
+            exe = os.path.join(gd, "nw.exe")
+            if not os.path.isfile(exe):
+                raise FileNotFoundError("nw.exe 不存在")
+        else:
+            raise FileNotFoundError("未找到可执行文件 (Game.exe 或 nw.exe)")
+
+    # Launch Game.exe via explorer (ShellExecute) — fully separate process tree.
+    # subprocess.Popen keeps Game.exe as child → Enigma anti-tamper can see parent.
+    os.startfile(exe)
+    return {"launched": True, "mode": mode, "skipPlugins": skip_plugins}
 
 
 def cmd_config() -> dict:
@@ -277,14 +387,15 @@ def cmd_tools_list() -> list[dict]:
          "description": "逆向工程工具"},
         {"name": "evbunpack", "url": "https://github.com/mos9527/evbunpack",
          "description": "EnigmaVB 解包工具"},
-        {"name": "ElushaInjector", "url": "https://github.com/example/elusha-injector",
+        {"name": "ElushaInjector", "url": "https://github.com/srcEcho/ailusha_plugin_Injector",
          "description": "艾露莎注入器源码"},
     ]
 
 
 def _sync_enabled_plugins(game_dir: str):
-    """Write elsmod_data/enabled_plugins.txt for DLL consumption."""
-    from . import registry
+    """Sync plugins to game: write injector_config.json (packed) or edit plugins.js (unpacked)."""
+    from . import registry, injector_config
+    mode = deploy.game_mode(game_dir)
     reg = registry.load(game_dir)
     load_order = reg.get("loadOrder", [])
     enabled = set()
@@ -292,11 +403,253 @@ def _sync_enabled_plugins(game_dir: str):
         if rec.get("enabled", False):
             enabled.add(rec["name"])
 
-    path = os.path.join(game_dir, "elsmod_data", "enabled_plugins.txt")
-    with open(path, "w", encoding="utf-8") as f:
-        for name in load_order:
-            if name in enabled:
-                f.write(name + "\n")
+    if mode == "packed":
+        cfg = injector_config.load(game_dir)
+        # Update plugins list
+        cfg["plugins"] = [n for n in load_order if n in enabled]
+
+        # If bootstrap mode and no redirects exist, add a default one
+        if cfg.get("injection_mode") == "bootstrap" and not cfg.get("redirects"):
+            cfg["redirects"] = [
+                {"target": "EventInformation.js",
+                 "source": "EventInformation_bootstrap.js"}
+            ]
+
+        injector_config.save(game_dir, cfg)
+
+        # Generate bootstrap files + copy originals
+        plugin_files = {}
+        for rec in reg.get("records", []):
+            if rec.get("enabled", False):
+                name = rec["name"]
+                plugin_files[name] = f"www/js/plugins/{name}.js"
+        # Try to copy originals from unpacked game or existing originals
+        deploy._ensure_originals(game_dir, cfg)
+        deploy._generate_bootstraps(game_dir, cfg, plugin_files)
+
+        # Also write enabled_plugins.txt for backward compatibility
+        path = os.path.join(game_dir, "elsmod_data", "enabled_plugins.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            for name in load_order:
+                if name in enabled:
+                    f.write(name + "\n")
+    elif mode == "unpacked":
+        _patch_plugins_js(game_dir, [n for n in load_order if n in enabled])
+
+
+def _patch_plugins_js(game_dir: str, enabled_plugins: list[str]):
+    """Directly edit www/js/plugins.js $plugins array. Unpacked mode only."""
+    path = os.path.join(game_dir, "www", "js", "plugins.js")
+    if not os.path.isfile(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Find the $plugins array bounds
+    var_pos = content.find("var $plugins")
+    if var_pos < 0:
+        return
+    bracket_start = content.find("[", var_pos)
+    if bracket_start < 0:
+        return
+    # Find matching ] — count nesting
+    depth = 0
+    bracket_end = -1
+    for i in range(bracket_start, len(content)):
+        if content[i] == "[":
+            depth += 1
+        elif content[i] == "]":
+            depth -= 1
+            if depth == 0:
+                bracket_end = i
+                break
+    if bracket_end < 0:
+        return
+
+    # Build new array entries
+    import json
+    entries = []
+    for name in enabled_plugins:
+        entries.append({"name": name, "status": True, "description": "", "parameters": {}})
+
+    if entries:
+        lines = ["["]
+        for i, e in enumerate(entries):
+            comma = "," if i < len(entries) - 1 else ""
+            lines.append("  " + json.dumps(e, ensure_ascii=False) + comma)
+        lines.append("]")
+        new_array = "\r\n".join(lines)
+    else:
+        new_array = "[]"
+
+    new_content = content[:bracket_start] + new_array + content[bracket_end + 1:]
+    if new_content != content:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+
+
+def cmd_validate(elsmod_path: str) -> dict:
+    """Validate an elsmod file without installing."""
+    gd = _game_dir()
+    if not os.path.isfile(elsmod_path):
+        raise FileNotFoundError(f"文件不存在：{elsmod_path}")
+    meta = elsmod.read_metadata(elsmod_path)
+    files = elsmod.list_files(elsmod_path)
+    return {"valid": True, "name": meta["name"], "version": meta["version"],
+            "author": meta.get("author", ""), "files": len(files)}
+
+
+def cmd_view_json(name: str) -> dict:
+    """Return full plugin.json content for a plugin."""
+    gd = _game_dir()
+    reg = registry.load(gd)
+    rec = registry.find_record(reg, name)
+    if not rec:
+        raise ValueError(f"插件 '{name}' 未找到")
+    plugins_dir = os.path.join(gd, "www/js/plugins")
+    for f in rec.get("files", []):
+        if f.endswith("plugin.json"):
+            fp = os.path.join(plugins_dir, f)
+            if os.path.isfile(fp):
+                with open(fp, "r", encoding="utf-8") as fh:
+                    return {"name": name, "pluginJson": json.loads(fh.read())}
+    raise ValueError(f"插件 '{name}' 的 plugin.json 未找到")
+
+
+def cmd_isolated_launch(name: str) -> dict:
+    """Launch game with only the named plugin enabled. State is saved and restored."""
+    gd = _game_dir()
+    reg = registry.load(gd)
+    # Save current state
+    saved = [(r["name"], r.get("enabled", False)) for r in reg["records"]]
+    # Disable all, enable only target
+    for r in reg["records"]:
+        r["enabled"] = (r["name"] == name)
+    registry.save(gd, reg)
+    _sync_enabled_plugins(gd)
+    # Launch
+    cmd_launch()
+    # Restore state in background after game closes
+    def _restore():
+        import time
+        while is_game_running():
+            time.sleep(2)
+        time.sleep(3)
+        reg2 = registry.load(gd)
+        for r in reg2["records"]:
+            for sn, se in saved:
+                if r["name"] == sn:
+                    r["enabled"] = se
+                    break
+        registry.save(gd, reg2)
+        _sync_enabled_plugins(gd)
+    import threading
+    threading.Thread(target=_restore, daemon=True).start()
+    return {"isolatedLaunch": name, "savedCount": len(saved)}
+
+
+def cmd_clean_orphans() -> dict:
+    """Remove files in www/js/plugins/ not tracked by registry."""
+    gd = _game_dir()
+    reg = registry.load(gd)
+    plugins_dir = os.path.join(gd, "www/js/plugins")
+    # Build set of all tracked files
+    tracked = set()
+    for rec in reg.get("records", []):
+        for f in rec.get("files", []):
+            tracked.add(f.replace("\\", "/"))
+    # Scan for orphans
+    orphan_files = []
+    orphan_dirs = []
+    for root, dirs, files in os.walk(plugins_dir, topdown=False):
+        for fn in files:
+            full = os.path.join(root, fn)
+            rel = os.path.relpath(full, plugins_dir).replace("\\", "/")
+            if rel not in tracked and rel != "plugin.registry.json":
+                orphan_files.append(full)
+        # Remove empty dirs after files
+        for d in dirs:
+            full_d = os.path.join(root, d)
+            try:
+                if not os.listdir(full_d):
+                    orphan_dirs.append(full_d)
+            except Exception:
+                pass
+    return {"orphanFiles": len(orphan_files), "orphanDirs": len(orphan_dirs),
+            "files": orphan_files, "dirs": orphan_dirs}
+
+
+def cmd_clean_orphans_execute() -> dict:
+    """Execute orphan cleanup."""
+    result = cmd_clean_orphans()
+    for f in result["files"]:
+        try: os.remove(f)
+        except Exception: pass
+    for d in result["dirs"]:
+        try: os.rmdir(d)
+        except Exception: pass
+    return {"cleaned": len(result["files"]) + len(result["dirs"])}
+
+
+def cmd_dep_tree() -> str:
+    """Generate text dependency tree of all enabled plugins."""
+    gd = _game_dir()
+    reg = registry.load(gd)
+    records = {r["name"]: r for r in reg["records"]}
+
+    def _tree(name: str, indent: str = "", visited: set = None) -> list[str]:
+        if visited is None:
+            visited = set()
+        if name in visited:
+            return [f"{indent}{name} (循环依赖!)"]
+        visited.add(name)
+        lines = [f"{indent}{name}"]
+        rec = records.get(name, {})
+        deps = rec.get("dependencies", [])
+        for i, d in enumerate(deps):
+            dn = d.get("name", "?")
+            is_last = (i == len(deps) - 1)
+            prefix = indent + ("  " if is_last else "│ ")
+            child_lines = _tree(dn, prefix, visited.copy())
+            for cl in child_lines:
+                lines.append(cl)
+        return lines
+
+    # Find root plugins (not depended on by any other enabled plugin)
+    enabled = {r["name"] for r in reg["records"] if r.get("enabled")}
+    depended_on = set()
+    for r in reg["records"]:
+        if not r.get("enabled"): continue
+        for d in r.get("dependencies", []):
+            if d.get("name"): depended_on.add(d["name"])
+
+    roots = [n for n in enabled if n not in depended_on]
+    if not roots:
+        roots = list(enabled)  # All interdependent
+
+    lines = []
+    for root in sorted(roots):
+        lines.extend(_tree(root))
+    return "\n".join(lines)
+
+
+def _send_to_trash(filepath: str) -> bool:
+    """Move a file to the Windows Recycle Bin. Returns True on success."""
+    import ctypes
+    from ctypes import wintypes
+    flags = 0x0004 | 0x0040 | 0x0100  # FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT
+    buf = ctypes.create_unicode_buffer(filepath + "\0\0", len(filepath) + 2)
+    shf = ctypes.windll.shell32.SHFileOperationW
+    shf.restype = ctypes.c_int
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [("hwnd", wintypes.HWND), ("wFunc", ctypes.c_uint),
+                    ("pFrom", ctypes.c_wchar_p), ("pTo", ctypes.c_wchar_p),
+                    ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL),
+                    ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", ctypes.c_wchar_p)]
+    op = SHFILEOPSTRUCTW()
+    op.hwnd = 0; op.wFunc = 3  # FO_DELETE
+    op.pFrom = buf; op.pTo = None; op.fFlags = flags
+    return shf(ctypes.byref(op)) == 0
 
 
 def cmd_version() -> dict:

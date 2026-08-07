@@ -38,7 +38,7 @@ def _handle(args) -> dict:
         return {"imported": result}
 
     elif args.command == "pack":
-        return cli_engine.cmd_pack(args.dir, args.output)
+        return cli_engine.cmd_pack(args.file, args.output)
 
     elif args.command == "unpack":
         return cli_engine.cmd_unpack(args.file, args.output)
@@ -76,6 +76,15 @@ def _handle(args) -> dict:
         from .core import elsmod_register
         elsmod_register.unregister()
         return {"unregistered": True}
+
+    elif args.command == "move-up":
+        return cli_engine.cmd_move_up(args.name)
+
+    elif args.command == "move-down":
+        return cli_engine.cmd_move_down(args.name)
+
+    elif args.command == "reorder":
+        return cli_engine.cmd_reorder(args.names)
 
     elif args.command == "version":
         return {"name": "艾露莎注入器", "version": "1.0"}
@@ -118,9 +127,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("imported", help="列出已导入的 elsmod")
 
     # pack
-    p = sub.add_parser("pack", help="打包为 elsmod")
-    p.add_argument("dir")
-    p.add_argument("-o", "--output", required=True)
+    p = sub.add_parser("pack", help="从 JS 文件打包为 elsmod（自动发现 data 目录）")
+    p.add_argument("file")
+    p.add_argument("-o", "--output", default=None)
 
     # unpack
     p = sub.add_parser("unpack", help="解包 elsmod")
@@ -136,6 +145,12 @@ def build_parser() -> argparse.ArgumentParser:
     # deploy
     p = sub.add_parser("deploy", help="部署环境")
     p.add_argument("--force", action="store_true")
+
+    # move-up / move-down
+    sub.add_parser("move-up", help="上移插件").add_argument("name")
+    sub.add_parser("move-down", help="下移插件").add_argument("name")
+    p = sub.add_parser("reorder", help="设置加载顺序")
+    p.add_argument("names", nargs="+")
 
     # launch
     p = sub.add_parser("launch", help="启动游戏")

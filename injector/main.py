@@ -24,20 +24,20 @@ def _is_cli_mode() -> bool:
 def main():
     # Check for double-click on .elsmod file
     if len(sys.argv) == 2 and sys.argv[1].endswith(".elsmod"):
-        from .core import cli_engine
+        from injector.core import cli_engine
         try:
             cli_engine.cmd_install(sys.argv[1])
         except Exception as e:
             import tkinter.messagebox as mb
             mb.showerror("导入失败", str(e))
         # Fall through to GUI
-        from .gui.main_window_pyside6 import run as gui_run
+        from injector.gui.main_window_pyside6 import run as gui_run
         gui_run()
         return
 
     # CLI mode: subcommand present
     if _is_cli_mode():
-        from .cli import main as cli_main
+        from injector.cli import main as cli_main
         cli_main()
         return
 
@@ -45,7 +45,7 @@ def main():
     dev_mode = "--dev" in sys.argv
 
     # GUI mode
-    from .gui.main_window_pyside6 import run as gui_run
+    from injector.gui.main_window_pyside6 import run as gui_run
     gui_run(dev_mode=dev_mode)
 
 

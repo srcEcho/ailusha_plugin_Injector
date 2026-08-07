@@ -3,7 +3,7 @@ import os, sys, webbrowser
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QCheckBox, QFileDialog,
-    QMessageBox, QDialog, QFormLayout, QTabWidget, QTextEdit, QLineEdit,
+    QMessageBox, QDialog, QFormLayout, QTabWidget, QTextEdit, QLineEdit, QInputDialog,
     QComboBox, QSpinBox, QStyleFactory, QFrame, QAbstractButton)
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QRectF, Property
 from PySide6.QtGui import QFont, QIcon, QDragEnterEvent, QDropEvent, QPainter, QColor, QBrush, QPen
@@ -11,6 +11,14 @@ from PySide6.QtGui import QFont, QIcon, QDragEnterEvent, QDropEvent, QPainter, Q
 from ..core import cli_engine, deploy
 from ..core.i18n import tr, load_config, save_config
 from ..core.themes import THEMES
+
+# Global CLI log sink — DevPanel subscribes to this
+_cli_sinks = []
+
+def _cli_log(msg: str):
+    for sink in _cli_sinks:
+        try: sink(msg)
+        except Exception: pass
 
 class ToggleSwitch(QAbstractButton):
     """Animated sliding toggle switch."""
@@ -67,18 +75,26 @@ class MainWindow(QMainWindow):
     def __init__(self, dev_mode: bool = False):
         super().__init__()
         self._dev_mode = dev_mode
-        self._game_dir = os.getcwd()
+        # PyInstaller --onefile: sys.argv[0] = real exe path, sys.executable = TEMP
+        try: exe_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        except Exception: exe_dir = os.getcwd()
+        self._game_dir = exe_dir if deploy.is_game_directory(exe_dir) else os.getcwd()
         self._settings_dlg = None
 
         if not deploy.is_game_directory(self._game_dir):
-            QMessageBox.critical(None, "Error", tr("zh", "error.game_dir"))
+            QMessageBox.critical(None, "Error",
+                                 "当前目录不包含 Game.exe 或 nw.exe。\n请将本程序放到游戏目录下运行。")
             sys.exit(1)
 
+        self._mode = deploy.game_mode(self._game_dir)
         deploy.setup(self._game_dir)
         self._cfg = load_config(self._game_dir)
         self._lang = self._cfg.get("lang", "zh")
         self._theme = self._cfg.get("theme", "slate_gray")
         self._font_size = self._cfg.get("font_size", 13)
+
+        mode_label = {"packed": "打包版", "unpacked": "解包版"}.get(self._mode, "未知")
+        self._mode_str = mode_label
 
         # Auto-register .elsmod
         try:
@@ -137,15 +153,31 @@ class MainWindow(QMainWindow):
         self._list.setDragDropMode(QListWidget.InternalMove)
         self._list.setDefaultDropAction(Qt.MoveAction)
         self._list.setSelectionMode(QListWidget.SingleSelection)
+        self._list.setStyleSheet(
+            "QListWidget{background:transparent;border:none;outline:none;}"
+            "QListWidget::item:selected{background:rgba(100,150,255,30);color:inherit;border:none;}"
+            "QListWidget::item:hover{background:rgba(255,255,255,8);}"
+        )
         self._list.doubleClicked.connect(lambda idx: self._on_detail(self._list.item(idx.row()).data(Qt.UserRole)))
         self._list.model().rowsMoved.connect(self._on_order_changed)
         root.addWidget(self._list, 1)
 
         btn_row = QHBoxLayout(); btn_row.setSpacing(8)
-        for key in ["close","import","launch","settings","more"]:
-            btn = QPushButton(t(f"btn.{key}"))
-            btn.clicked.connect(getattr(self, f"_on_{key}"))
-            btn_row.addWidget(btn)
+        for key in ["import","launch","settings","advanced"]:
+            if key == "launch":
+                launch_btn = QPushButton(t("btn.launch"))
+                launch_btn.clicked.connect(self._on_launch)
+                btn_row.addWidget(launch_btn)
+                # game exe selector — users may rename their game exe
+                self._exe_combo = QComboBox()
+                self._exe_combo.setMinimumWidth(160)
+                self._exe_combo.setToolTip("选择要启动的游戏程序")
+                self._refresh_exe_combo()
+                btn_row.addWidget(self._exe_combo)
+            else:
+                btn = QPushButton(t(f"btn.{key}"))
+                btn.clicked.connect(getattr(self, f"_on_{key}"))
+                btn_row.addWidget(btn)
         if self._dev_mode:
             dev_btn = QPushButton(t("btn.dev"))
             dev_btn.clicked.connect(self._on_dev_panel)
@@ -170,26 +202,37 @@ class MainWindow(QMainWindow):
             self._list.addItem(item)
 
             card = QWidget(); card.setObjectName("pluginCard")
-            if is_broken: card.setStyleSheet("background:#fff0f0;border:1px solid #e06060;border-radius:4px;")
+            # red border only — let app theme handle background
+            if is_broken:
+                card.setStyleSheet("#pluginCard{border:2px solid #cc5555;border-radius:6px;}#pluginCard:hover{border-color:#ff5555;}")
             layout = QHBoxLayout(card); layout.setContentsMargins(8, 6, 8, 6)
             info = QVBoxLayout(); info.setSpacing(1)
-            nl = QLabel(f"⚠ {name} ({t('detail.broken')})" if is_broken else name)
+            nl = QLabel(name)
             nl.setFont(QFont("", max(11, self._font_size - 2), QFont.Bold))
-            if is_broken: nl.setStyleSheet("color:#c02020;")
+            if is_broken: nl.setStyleSheet("color:#e06060;")
             info.addWidget(nl)
             sub = f"v{p.get('version','?')}"
             if p.get("description"): sub += f" — {p.get('description')}"
-            info.addWidget(QLabel(sub))
+            if is_broken: sub += f"  ·  {t('detail.broken')}"
+            sl = QLabel(sub)
+            if is_broken: sl.setStyleSheet("color:#cc7777;")
+            info.addWidget(sl)
+            layout.addLayout(info, 1)
+
+            # right side: repair button (if broken) + toggle switch
+            right = QHBoxLayout(); right.setSpacing(6)
             if is_broken:
                 rb = QPushButton(t("btn.repair"))
+                rb.setFixedHeight(26)
                 rb.clicked.connect(lambda c, n=name: self._on_repair(n))
-                info.addWidget(rb)
-            layout.addLayout(info, 1)
+                right.addWidget(rb)
             sw = ToggleSwitch()
             sw.setChecked(enabled); sw.setEnabled(not is_broken)
             sw.toggled.connect(lambda checked, n=name: self._on_toggle(n, checked))
-            layout.addWidget(sw)
             sw.setToolTip("启用" if self._lang == "zh" else ("Enable" if self._lang == "en" else "有効"))
+            right.addWidget(sw)
+            layout.addLayout(right)
+
             card.setLayout(layout)
             item.setSizeHint(card.sizeHint())
             self._list.setItemWidget(item, card)
@@ -203,10 +246,7 @@ class MainWindow(QMainWindow):
         return [self._list.item(i).data(Qt.UserRole) for i in range(self._list.count())]
 
     def _on_order_changed(self):
-        from ..core import registry
-        reg = registry.load(self._game_dir)
-        reg["loadOrder"] = self._get_current_order()
-        registry.save(self._game_dir, reg)
+        cli_engine.cmd_reorder(self._get_current_order())
 
     def _check_game_running(self):
         running = cli_engine.is_game_running()
@@ -222,6 +262,7 @@ class MainWindow(QMainWindow):
 
     def _on_toggle(self, name, enabled):
         if self._guard(): self._refresh(); return
+        _cli_log(f"> ElushaInjector.exe --cli {'enable' if enabled else 'disable'} \"{name}\"")
         try:
             if enabled:
                 r = cli_engine.cmd_enable(name)
@@ -241,15 +282,52 @@ class MainWindow(QMainWindow):
         if self._guard(): return
         fp, _ = QFileDialog.getOpenFileName(self, "Import", "", "Elusha Mod (*.elsmod);;All (*.*)")
         if not fp: return
+        _cli_log(f"> ElushaInjector.exe --cli install \"{fp}\"")
         try:
             r = cli_engine.cmd_install(fp)
-            QMessageBox.information(self, self._t("import.success"), f"{r['installed']} v{r['version']}")
             self._refresh()
         except FileExistsError as e: QMessageBox.warning(self, self._t("import.exists"), str(e))
         except Exception as e: QMessageBox.critical(self, self._t("import.failed"), str(e))
 
+    # exe names to hide from the game selector
+    _OWN_EXES = {"ElushaInjector.exe", "UninstallElusha.exe", "ElushaInstaller.exe"}
+
+    def _scan_exes(self):
+        """Return sorted list of .exe files in game dir, excluding injector's own."""
+        exes = []
+        try:
+            for f in os.listdir(self._game_dir):
+                if f.lower().endswith(".exe") and f not in self._OWN_EXES:
+                    exes.append(f)
+        except Exception:
+            pass
+        return sorted(exes)
+
+    def _refresh_exe_combo(self):
+        """Repopulate the game exe dropdown and restore saved selection."""
+        self._exe_combo.clear()
+        exes = self._scan_exes()
+        self._exe_combo.addItems(exes)
+        saved = self._cfg.get("game_exe", "")
+        if saved and saved in exes:
+            self._exe_combo.setCurrentText(saved)
+        elif "Game.exe" in exes:
+            self._exe_combo.setCurrentText("Game.exe")
+        elif "nw.exe" in exes:
+            self._exe_combo.setCurrentText("nw.exe")
+        elif exes:
+            self._exe_combo.setCurrentIndex(0)
+
     def _on_launch(self):
-        try: cli_engine.cmd_launch(); self._check_game_running()
+        exe_name = self._exe_combo.currentText()
+        if not exe_name:
+            QMessageBox.warning(self, "", "未找到可执行文件，请检查游戏目录")
+            return
+        # remember choice
+        self._cfg["game_exe"] = exe_name
+        save_config(self._game_dir, self._cfg)
+        _cli_log(f"> launch \"{exe_name}\" (cwd={self._game_dir})")
+        try: cli_engine.cmd_launch(exe_name=exe_name); self._check_game_running()
         except Exception as e: QMessageBox.critical(self, "Error", str(e))
 
     def _on_detail(self, name):
@@ -264,8 +342,18 @@ class MainWindow(QMainWindow):
         except Exception as e: QMessageBox.critical(self, self._t("repair.failed"), str(e))
 
     def _on_close(self): self.close()
-    def _on_more(self): webbrowser.open("https://github.com")
-    def _on_dev_panel(self): DevPanel(self, self._game_dir, self._lang).exec()
+    def _on_advanced(self):
+        self._adv_panel = AdvancedPanel(self, self._game_dir, self._lang, self._font_size)
+        self._adv_panel.setAttribute(Qt.WA_DeleteOnClose)
+        self._adv_panel.show()
+    def _on_dev_panel(self):
+        if hasattr(self, '_dev_panel') and self._dev_panel.isVisible():
+            self._dev_panel.raise_()
+            return
+        self._dev_panel = DevPanel(self, self._game_dir, self._lang)
+        self._dev_panel.setAttribute(Qt.WA_DeleteOnClose)
+        self._dev_panel.destroyed.connect(lambda: delattr(self, '_dev_panel'))
+        self._dev_panel.show()
 
     def _on_settings(self):
         if self._settings_dlg: self._settings_dlg.close()
@@ -315,6 +403,65 @@ class MainWindow(QMainWindow):
         if central: central.deleteLater()
         self._build_ui(); self._refresh()
         self.setGeometry(geom)
+
+
+class AdvancedPanel(QDialog):
+    """Non-modal advanced settings — hook library + injection method."""
+
+    def __init__(self, parent, game_dir, lang, font_size):
+        super().__init__(parent)
+        t = lambda k: tr(lang, k)
+        self._gd, self._lang, self._t = game_dir, lang, t
+        self.setWindowTitle(t("advanced.title"))
+        self.setMinimumSize(420, 280)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+
+        lyt = QVBoxLayout(self)
+        lyt.setSpacing(12)
+        lyt.addWidget(QLabel(t("advanced.subtitle")))
+
+        # Build 5 dropdown rows
+        self._combos = {}
+        dimensions = ["entry_point", "hook_library", "injection_entry",
+                      "file_passthrough", "injection_mode"]
+        from ..core import injector_config
+
+        for dim in dimensions:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(t(f"advanced.{dim}")))
+            combo = QComboBox()
+            for opt in injector_config.OPTIONS[dim]:
+                label = opt.get(f"label_{lang}", opt.get("label_zh", opt["value"]))
+                combo.addItem(label, opt["value"])
+            row.addWidget(combo, 1)
+            lyt.addLayout(row)
+            self._combos[dim] = combo
+
+        # Load current config
+        cfg = injector_config.load(game_dir)
+        for dim, combo in self._combos.items():
+            val = cfg.get(dim)
+            for i in range(combo.count()):
+                if combo.itemData(i) == val:
+                    combo.setCurrentIndex(i); break
+
+        lyt.addStretch()
+
+        # Save button
+        save_btn = QPushButton(t("advanced.save"))
+        save_btn.clicked.connect(self._on_save)
+        lyt.addWidget(save_btn)
+
+        # Apply font size
+        self.setStyleSheet(f"font-size:{font_size}px;")
+
+    def _on_save(self):
+        from ..core import injector_config
+        cfg = {dim: combo.currentData() for dim, combo in self._combos.items()}
+        injector_config.save(self._gd, cfg)
+        t = self._t
+        QMessageBox.information(self, t("advanced.saved.title"), t("advanced.saved.text"))
+        self.accept()
 
 
 class DetailDialog(QDialog):
@@ -420,13 +567,24 @@ class DevPanel(QDialog):
         lyt = QVBoxLayout(self)
         lyt.addWidget(QLabel(t("dev.subtitle")))
         tabs = QTabWidget(); lyt.addWidget(tabs)
-        aw = QWidget(); al = QVBoxLayout(aw)
+        # Dev tools tab
+        dev_tab = QWidget(); dtl = QVBoxLayout(dev_tab)
+        dtl.addWidget(QLabel("— 项目管理 —"))
         for k in ["pack","unpack","template"]:
-            al.addWidget(QPushButton(t(f"btn.{k}"), clicked=getattr(self, f"_{k}")))
-        al.addStretch(); tabs.addTab(aw, t("dev.tab.actions"))
+            dtl.addWidget(QPushButton(t(f"btn.{k}"), clicked=getattr(self, f"_{k}")))
+        dtl.addWidget(QLabel("— 开发工具 —"))
+        dtl.addWidget(QPushButton("验证 elsmod", clicked=self._validate_elsmod))
+        dtl.addWidget(QPushButton("查看 plugin.json", clicked=self._view_json))
+        dtl.addWidget(QPushButton("孤立启动", clicked=self._isolated_launch))
+        dtl.addStretch(); tabs.addTab(dev_tab, "开发工具")
+        # CLI tab
         tw = QWidget(); tl = QVBoxLayout(tw)
-        self._term = QTextEdit(); self._term.setReadOnly(True); tl.addWidget(self._term)
-        tabs.addTab(tw, t("dev.tab.terminal"))
+        self._cli = QTextEdit(); self._cli.setReadOnly(True)
+        self._cli.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+        tl.addWidget(self._cli)
+        tabs.addTab(tw, t("dev.tab.cli"))
+        _cli_sinks.append(self._log)
+        # Links tab
         tww = QWidget(); twl = QVBoxLayout(tww)
         for tool in cli_engine.cmd_tools_list():
             r = QHBoxLayout()
@@ -435,21 +593,26 @@ class DevPanel(QDialog):
             twl.addLayout(r)
         twl.addStretch(); tabs.addTab(tww, t("dev.tab.tools"))
 
-    def _log(self, m): self._term.append(m)
+    def _log(self, m): self._cli.append(m)
     def _pack(self):
-        d = QFileDialog.getExistingDirectory(self);
-        if not d: return
-        o, _ = QFileDialog.getSaveFileName(self, "", "", "*.elsmod")
-        if not o: return
-        try: self._log(f"packed: {cli_engine.cmd_pack(d, o)['packed']}")
-        except Exception as e: QMessageBox.critical(self, "Error", str(e))
+        fp, _ = QFileDialog.getOpenFileName(self, "选择插件 JS 文件", self._gd, "JavaScript (*.js)")
+        if not fp: return
+        self._log(f"> pack \"{fp}\"")
+        try:
+            r = cli_engine.cmd_pack(fp)
+            self._log(f"  OK: {r['packed']}")
+            QMessageBox.information(self, "打包完成", f"{r['name']} v{r['version']}\n→ {r['packed']}")
+        except Exception as e:
+            self._log(f"  ERROR: {e}")
+            QMessageBox.critical(self, "打包失败", str(e))
     def _unpack(self):
         f, _ = QFileDialog.getOpenFileName(self, "", "", "*.elsmod")
         if not f: return
         d = QFileDialog.getExistingDirectory(self)
         if not d: return
-        try: self._log(f"unpacked: {cli_engine.cmd_unpack(f, d)['unpacked']}")
-        except Exception as e: QMessageBox.critical(self, "Error", str(e))
+        self._log(f"> ElushaInjector.exe --cli unpack \"{f}\" -o \"{d}\"")
+        try: self._log(f"  OK: {cli_engine.cmd_unpack(f, d)['unpacked']}")
+        except Exception as e: self._log(f"  ERROR: {e}"); QMessageBox.critical(self, "Error", str(e))
     def _template(self):
         t = self._t
         dlg = QDialog(self); dlg.setWindowTitle("Template"); dlg.setMinimumSize(360, 200)
@@ -460,10 +623,99 @@ class DevPanel(QDialog):
         de = QLineEdit(); dr.addWidget(de)
         dr.addWidget(QPushButton(t("btn.browse"), clicked=lambda: de.setText(QFileDialog.getExistingDirectory(dlg)))); l.addLayout(dr)
         def _do():
-            try: r = cli_engine.cmd_template(ne.text(), ae.text(), de.text()); self._log(f"template: {r['templateCreated']}"); dlg.accept()
-            except Exception as e: QMessageBox.critical(dlg, "Error", str(e))
+            n, a, d = ne.text(), ae.text(), de.text()
+            self._log(f"> ElushaInjector.exe --cli template --name \"{n}\" --author \"{a}\" --dir \"{d}\"")
+            try: r = cli_engine.cmd_template(n, a, d); self._log(f"  OK: {r['templateCreated']}"); dlg.accept()
+            except Exception as e: self._log(f"  ERROR: {e}"); QMessageBox.critical(dlg, "Error", str(e))
         l.addWidget(QPushButton(t("btn.generate"), clicked=_do))
         dlg.exec()
+
+
+    def _validate_elsmod(self):
+        fp, _ = QFileDialog.getOpenFileName(self, "选择 elsmod", "", "*.elsmod")
+        if not fp: return
+        self._log(f"> validate \"{fp}\"")
+        try:
+            r = cli_engine.cmd_validate(fp)
+            msg = f"✓ 验证通过\n\n名称: {r['name']}\n版本: {r['version']}\n作者: {r['author']}\n文件数: {r['files']}"
+            self._log(msg.replace("\n", "  "))
+            QMessageBox.information(self, "验证结果", msg)
+        except Exception as e:
+            self._log(f"  ✗ {e}")
+            QMessageBox.warning(self, "验证结果", f"✗ 验证失败\n\n{e}")
+
+    def _view_json(self):
+        fp, _ = QFileDialog.getOpenFileName(self, "选择 elsmod 文件", "", "*.elsmod")
+        if not fp: return
+        self._log(f"> view-json \"{fp}\"")
+        try:
+            import json, zipfile
+            with zipfile.ZipFile(fp, "r") as zf:
+                json_path = None
+                for name in zf.namelist():
+                    if name.endswith("plugin.json") and "/data/" in name:
+                        json_path = name; break
+                if not json_path:
+                    raise ValueError("elsmod 内未找到 plugin.json")
+                data = json.loads(zf.read(json_path).decode("utf-8"))
+            text = json.dumps(data, ensure_ascii=False, indent=2)
+            self._log(text[:200] + "..." if len(text) > 200 else text)
+            dlg = QDialog(self)
+            dlg.setWindowTitle(f"plugin.json — {data.get('name', '?')}")
+            dlg.setMinimumSize(500, 400)
+            l = QVBoxLayout(dlg)
+            te = QTextEdit(); te.setReadOnly(True); te.setPlainText(text)
+            l.addWidget(te)
+            l.addWidget(QPushButton("关闭", clicked=dlg.accept))
+            dlg.exec()
+        except Exception as e:
+            self._log(f"  ERROR: {e}")
+            QMessageBox.warning(self, "错误", str(e))
+
+    def _isolated_launch(self):
+        if cli_engine.is_game_running():
+            QMessageBox.warning(self, "", "请先关闭游戏")
+            return
+        fp, _ = QFileDialog.getOpenFileName(self, "选择 elsmod", "", "*.elsmod")
+        if not fp: return
+        self._log(f"> isolated-launch \"{fp}\"")
+        try:
+            from ..core import registry, installer
+            # Save current state
+            reg = registry.load(self._gd)
+            saved = [(r["name"], r.get("enabled", False)) for r in reg["records"]]
+            # Install the plugin
+            rec = installer.install(self._gd, fp)
+            # Disable all except this one
+            reg = registry.load(self._gd)
+            for r in reg["records"]:
+                r["enabled"] = (r["name"] == rec["name"])
+            registry.save(self._gd, reg)
+            from ..core.cli_engine import _sync_enabled_plugins
+            _sync_enabled_plugins(self._gd)
+            # Launch
+            cli_engine.cmd_launch()
+            self._log(f"  已启动，仅启用 {rec['name']}，游戏关闭后自动恢复")
+            # Restore after game closes
+            def _restore():
+                import time
+                while cli_engine.is_game_running(): time.sleep(2)
+                time.sleep(3)
+                # Uninstall the temp plugin
+                try: installer.uninstall(self._gd, rec["name"])
+                except Exception: pass
+                reg2 = registry.load(self._gd)
+                for r in reg2["records"]:
+                    for sn, se in saved:
+                        if r["name"] == sn: r["enabled"] = se; break
+                registry.save(self._gd, reg2)
+                _sync_enabled_plugins(self._gd)
+            import threading
+            threading.Thread(target=_restore, daemon=True).start()
+        except Exception as e:
+            self._log(f"  ERROR: {e}")
+            QMessageBox.critical(self, "错误", str(e))
+
 
 
 def _fd(deps, lang):
@@ -474,6 +726,9 @@ def _fd(deps, lang):
 def run(dev_mode=False):
     app = QApplication(sys.argv)
     app.setStyle(QStyleFactory.create("Fusion"))
+    # Suppress MS Sans Serif fallback warnings
+    f = QFont("Segoe UI", 10)
+    app.setFont(f)
     try:
         ico = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Injector_logo.ico")
         if os.path.exists(ico): app.setWindowIcon(QIcon(ico))
