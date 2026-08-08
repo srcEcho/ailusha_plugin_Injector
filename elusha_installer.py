@@ -188,6 +188,14 @@ def _get_icon_path() -> str:
                         "injector", "Injector_logo.ico")
 
 
+def _get_logo_png_path() -> str:
+    """Return path to Injector_logo.png for display in pages."""
+    if getattr(sys, "frozen", False):
+        return os.path.join(_get_frozen_base(), "injector", "Injector_logo.png")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "injector", "Injector_logo.png")
+
+
 def _get_payload_dir() -> str:
     if getattr(sys, "frozen", False):
         return os.path.join(_get_frozen_base(), "ElushaInjector")
@@ -765,6 +773,24 @@ class InstallerWizard(tk.Tk):
         bar = ttk.Frame(self)
         bar.pack(fill=tk.X, padx=12, pady=(8, 0))
 
+        # Logo on the left
+        try:
+            png = _get_logo_png_path()
+            if os.path.exists(png):
+                self._logo_img = tk.PhotoImage(file=png)
+                # Scale to ~24px height while keeping aspect ratio
+                img_h = self._logo_img.height()
+                img_w = self._logo_img.width()
+                if img_h > 24:
+                    factor = 24 / img_h
+                    self._logo_img = self._logo_img.subsample(
+                        max(1, int(1 / factor)), max(1, int(1 / factor)))
+                logo_lbl = ttk.Label(bar, image=self._logo_img,
+                                     background="#2b2b2b")
+                logo_lbl.pack(side=tk.LEFT, padx=(0, 8))
+        except Exception:
+            pass  # no PIL, no PNG support — skip logo
+
         self._lang_label = ttk.Label(bar, style="Subtitle.TLabel")
         self._lang_label.pack(side=tk.LEFT, padx=(0, 4))
 
@@ -879,16 +905,30 @@ class InstallerWizard(tk.Tk):
                     _copy_with_progress(src, dst)
 
             # Write install manifest — single source of truth for uninstaller
+            elsmod_dir = os.path.join(game_dir, "elsmod_data")
             try:
-                manifest_dir = os.path.join(game_dir, "elsmod_data")
-                os.makedirs(manifest_dir, exist_ok=True)
-                manifest_path = os.path.join(manifest_dir,
+                os.makedirs(elsmod_dir, exist_ok=True)
+                manifest_path = os.path.join(elsmod_dir,
                                              "install_manifest.json")
                 with open(manifest_path, "w", encoding="utf-8") as f:
                     _json.dump({"items": sorted(installed)}, f,
                               ensure_ascii=False, indent=2)
             except Exception:
                 pass  # non-critical
+
+            # Backup original plugins.js for unpacked games.
+            # The installer runs before the injector ever touches the game,
+            # so plugins.js is guaranteed to be the pristine original.
+            plugins_js = os.path.join(game_dir, "www", "js", "plugins.js")
+            if os.path.isfile(plugins_js):
+                try:
+                    backup_dir = os.path.join(elsmod_dir, "originals",
+                                              "www", "js")
+                    os.makedirs(backup_dir, exist_ok=True)
+                    shutil.copy2(plugins_js, os.path.join(backup_dir,
+                                                          "plugins.js"))
+                except Exception:
+                    pass  # non-critical
 
             # Register .elsmod file association to the installed injector.
             # Note: we do NOT delete UserChoice here — Windows would show a

@@ -2,6 +2,8 @@
 GUI is a thin wrapper that calls these functions and displays results."""
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 from typing import Optional
@@ -484,58 +486,231 @@ def _sync_enabled_plugins(game_dir: str):
                 if name in enabled:
                     f.write(name + "\n")
     elif mode == "unpacked":
-        _patch_plugins_js(game_dir, [n for n in load_order if n in enabled])
+        _sync_unpacked_plugins(game_dir, [n for n in load_order if n in enabled])
 
 
-def _patch_plugins_js(game_dir: str, enabled_plugins: list[str]):
-    """Directly edit www/js/plugins.js $plugins array. Unpacked mode only."""
+def _parse_js_array_entries(text: str) -> list[str]:
+    """Parse JS array text into individual top-level object entries.
+
+    Handles nested braces inside string values (e.g. JSON in ``parameters``).
+    Returns a list of raw entry strings (including outer braces)."""
+    entries = []
+    i = 0
+    n = len(text)
+
+    while i < n:
+        c = text[i]
+        # Skip whitespace and commas between entries
+        if c in " \t\r\n,":
+            i += 1
+            continue
+        if c == "{":
+            depth = 0
+            start = i
+            in_string = False
+            escape = False
+            while i < n:
+                ch = text[i]
+                if escape:
+                    escape = False
+                    i += 1
+                    continue
+                if ch == "\\":
+                    escape = True
+                    i += 1
+                    continue
+                if ch == '"':
+                    in_string = not in_string
+                elif not in_string:
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            entries.append(text[start:i + 1])
+                            i += 1
+                            break
+                i += 1
+        else:
+            i += 1
+
+    return entries
+
+
+def _find_array_end(content: str, bracket_start: int) -> int:
+    """Find the matching ``]`` for the ``[`` at bracket_start.
+
+    String‑aware: ignores ``[`` / ``]`` inside double‑quoted strings (including
+    escape sequences like ``\\"``).  Returns -1 if no match is found."""
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(bracket_start, len(content)):
+        ch = content[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _sync_unpacked_plugins(game_dir: str, enabled_plugins: list[str]):
+    """Sync mod plugins into www/js/plugins.js for unpacked (non-Enigma) games.
+
+    Strategy:
+      1. On first use: backup original plugins.js → elsmod_data/originals/
+      2. APPEND mod plugins to the existing $plugins array (preserving built-ins)
+      3. When all mods are disabled: restore original from backup
+      4. Corruption detection: if the file is broken, auto-restore from backup
+    """
     path = os.path.join(game_dir, "www", "js", "plugins.js")
+    originals_dir = os.path.join(game_dir, "elsmod_data", "originals", "www", "js")
+    backup_path = os.path.join(originals_dir, "plugins.js")
+    _clog(f"_sync_unpacked_plugins: path={path} enabled={enabled_plugins}")
+
+    # ── Check source file exists ──
     if not os.path.isfile(path):
+        _clog(f"_sync_unpacked_plugins: plugins.js MISSING at {path}")
+
+    # ── Empty mod list → restore from backup ──
+    if not enabled_plugins:
+        if os.path.isfile(backup_path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            shutil.copy2(backup_path, path)
+            _clog("_sync_unpacked_plugins: all mods disabled — restored from backup")
         return
+
+    # ── Ensure source file exists (try restore from backup) ──
+    if not os.path.isfile(path):
+        if os.path.isfile(backup_path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            shutil.copy2(backup_path, path)
+            _clog("_sync_unpacked_plugins: restored missing plugins.js from backup")
+        else:
+            _clog("_sync_unpacked_plugins: no source and no backup — aborting")
+            return
+
+    # ── Read current file ──
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    # Find the $plugins array bounds
+    # ── Locate & validate $plugins array ──
     var_pos = content.find("var $plugins")
     if var_pos < 0:
-        return
+        _clog("_sync_unpacked_plugins: CORRUPTED — 'var $plugins' not found, restoring backup")
+        if os.path.isfile(backup_path):
+            shutil.copy2(backup_path, path)
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            var_pos = content.find("var $plugins")
+        if var_pos < 0:
+            _clog("_sync_unpacked_plugins: backup also broken — aborting")
+            return
+
     bracket_start = content.find("[", var_pos)
     if bracket_start < 0:
-        return
-    # Find matching ] — count nesting
-    depth = 0
-    bracket_end = -1
-    for i in range(bracket_start, len(content)):
-        if content[i] == "[":
-            depth += 1
-        elif content[i] == "]":
-            depth -= 1
-            if depth == 0:
-                bracket_end = i
-                break
+        _clog("_sync_unpacked_plugins: CORRUPTED — no opening bracket after $plugins, restoring backup")
+        if os.path.isfile(backup_path):
+            shutil.copy2(backup_path, path)
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            var_pos = content.find("var $plugins")
+            bracket_start = content.find("[", var_pos) if var_pos >= 0 else -1
+        if bracket_start < 0:
+            _clog("_sync_unpacked_plugins: backup also broken — aborting")
+            return
+
+    # Find matching ] — string‑aware to avoid false matches inside strings
+    bracket_end = _find_array_end(content, bracket_start)
     if bracket_end < 0:
-        return
+        _clog("_sync_unpacked_plugins: CORRUPTED — unclosed bracket, restoring backup")
+        if os.path.isfile(backup_path):
+            shutil.copy2(backup_path, path)
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            var_pos = content.find("var $plugins")
+            bracket_start = content.find("[", var_pos) if var_pos >= 0 else -1
+            if bracket_start >= 0:
+                bracket_end = _find_array_end(content, bracket_start)
+        if bracket_end < 0:
+            _clog("_sync_unpacked_plugins: backup also broken — aborting")
+            return
 
-    # Build new array entries
-    import json
-    entries = []
+    # ── Parse existing entries ──
+    array_text = content[bracket_start + 1:bracket_end]
+    existing_entries = _parse_js_array_entries(array_text)
+    _clog(f"_sync_unpacked_plugins: parsed {len(existing_entries)} existing entries")
+
+    # ── Collect mod plugin names from registry ──
+    mod_names = set()
+    try:
+        reg = registry.load(game_dir)
+        for rec in reg.get("records", []):
+            mod_names.add(rec["name"])
+    except Exception:
+        pass
+    _clog(f"_sync_unpacked_plugins: {len(mod_names)} mod names in registry")
+
+    # ── Filter: keep built-in plugins, remove previously-injected mod plugins ──
+    kept_entries = []
+    removed = []
+    for entry_str in existing_entries:
+        m = re.search(r'"name"\s*:\s*"([^"]+)"', entry_str)
+        if m and m.group(1) in mod_names:
+            removed.append(m.group(1))
+            continue
+        kept_entries.append(entry_str)
+    if removed:
+        _clog(f"_sync_unpacked_plugins: removed previously-injected mod entries: {removed}")
+
+    # ── Append currently-enabled mod plugins ──
+    # Verify the physical .js file exists before injecting — prevents
+    # "Failed to load: js/plugins/X.js" at game startup after the file
+    # was deleted (e.g. by uninstaller or manual cleanup).
+    plugins_js_dir = os.path.join(game_dir, "www", "js", "plugins")
+    skipped_missing = []
     for name in enabled_plugins:
-        entries.append({"name": name, "status": True, "description": "", "parameters": {}})
+        if not os.path.isfile(os.path.join(plugins_js_dir, f"{name}.js")):
+            skipped_missing.append(name)
+            _clog(f"_sync_unpacked_plugins: SKIPPING '{name}' — {name}.js not found in www/js/plugins/")
+            continue
+        kept_entries.append(
+            json.dumps({"name": name, "status": True, "description": "", "parameters": {}},
+                       ensure_ascii=False)
+        )
+    actual_count = len(enabled_plugins) - len(skipped_missing)
+    _clog(f"_sync_unpacked_plugins: final array → {actual_count} mod + {len(kept_entries) - actual_count} built-in entries" +
+          (f" (skipped {len(skipped_missing)}: {skipped_missing})" if skipped_missing else ""))
 
-    if entries:
-        lines = ["["]
-        for i, e in enumerate(entries):
-            comma = "," if i < len(entries) - 1 else ""
-            lines.append("  " + json.dumps(e, ensure_ascii=False) + comma)
-        lines.append("]")
-        new_array = "\r\n".join(lines)
-    else:
-        new_array = "[]"
+    # ── Rebuild array ──
+    indent = "  "
+    lines = ["["]
+    for i, entry_str in enumerate(kept_entries):
+        comma = "," if (i < len(kept_entries) - 1) else ""
+        lines.append(indent + entry_str.strip() + comma)
+    lines.append("]")
+    new_array = "\r\n".join(lines)
 
     new_content = content[:bracket_start] + new_array + content[bracket_end + 1:]
     if new_content != content:
         with open(path, "w", encoding="utf-8") as f:
             f.write(new_content)
+        _clog(f"_sync_unpacked_plugins: plugins.js written ({len(new_content)} bytes)")
+    else:
+        _clog("_sync_unpacked_plugins: no change needed")
 
 
 def cmd_validate(elsmod_path: str) -> dict:

@@ -8,6 +8,7 @@ Cleanup strategy (three-layer):
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -341,6 +342,66 @@ def _cleanup_elsmod_registry():
     _ulog("_cleanup_elsmod_registry: end")
 
 
+def _restore_plugins_js():
+    """Restore original plugins.js from backup and strip any mod plugin entries.
+
+    Restores the backup (unpacked mode), then strips every entry whose
+    ``"name"`` matches a mod plugin in the registry.  This is belt-and-
+    suspenders: even if the backup was created *after* mod plugins were
+    injected (corrupted backup), the result will be clean.
+    """
+    target = os.path.join(GAME_DIR, "www", "js", "plugins.js")
+
+    # Phase 1 — Restore from backup (if available)
+    backup = os.path.join(GAME_DIR, "elsmod_data", "originals",
+                          "www", "js", "plugins.js")
+    if os.path.isfile(backup):
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copy2(backup, target)
+            _ulog("_restore_plugins_js: restored original plugins.js from backup")
+        except OSError as e:
+            _ulog(f"_restore_plugins_js: FAILED — {e}")
+            return
+
+    # Phase 2 — Strip mod plugin entries
+    if not os.path.isfile(target):
+        return
+
+    # Collect mod plugin names from registry
+    mod_names = set()
+    try:
+        with open(REGISTRY_PATH, "r", encoding="utf-8") as f:
+            reg = json.load(f)
+        for rec in reg.get("records", []):
+            mod_names.add(rec["name"])
+    except Exception:
+        pass
+
+    if not mod_names:
+        return
+
+    with open(target, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    new_lines = []
+    removed = 0
+    for line in lines:
+        stripped = line.strip()
+        # Each plugin entry is a single-line JSON object
+        if stripped.startswith("{") and '"name"' in stripped:
+            m = re.search(r'"name"\s*:\s*"([^"]+)"', stripped)
+            if m and m.group(1) in mod_names:
+                removed += 1
+                continue
+        new_lines.append(line)
+
+    if removed:
+        with open(target, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+        _ulog(f"_restore_plugins_js: stripped {removed} mod plugin entries")
+
+
 def uninstall(keep_elsmod_data: bool, keep_plugins: bool):
     """Three-layer cleanup. Returns list of locked paths for batch cleanup."""
     _ulog(f"uninstall: keep_elsmod_data={keep_elsmod_data} keep_plugins={keep_plugins}")
@@ -380,6 +441,9 @@ def uninstall(keep_elsmod_data: bool, keep_plugins: bool):
             os.remove(dll)
         except OSError:
             pass
+
+    # ── Restore original plugins.js for unpacked mode ──
+    _restore_plugins_js()
 
     # ── Layer 1: Manifest-driven (covers 99% of files) ──
     _ulog("uninstall: Layer 1 — manifest cleanup")
