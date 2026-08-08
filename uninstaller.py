@@ -14,12 +14,37 @@ import sys
 import tkinter as tk
 from tkinter import ttk, messagebox
 
+# Pre-load ctypes + winreg at module level — these must be in memory BEFORE
+# Layer 1 deletes their .pyd/.dll files from disk.  Late imports inside
+# _cleanup_elsmod_registry() would crash the process because the .pyd file
+# is already gone by the time the function runs.
+import ctypes
+import winreg
+
 GAME_DIR = os.path.dirname(os.path.abspath(sys.executable
                            if getattr(sys, 'frozen', False)
                            else os.path.abspath(__file__)))
 REGISTRY_PATH = os.path.join(GAME_DIR, "elsmod_data", "registry.json")
 PLUGINS_DIR = os.path.join(GAME_DIR, "www", "js", "plugins")
 MANIFEST_PATH = os.path.join(GAME_DIR, "elsmod_data", "install_manifest.json")
+
+
+# ── Diagnostic logging ──
+_LOG_DIR = r"D:\log"
+_LOG_LOCK = __import__('threading').Lock()
+def _ulog(msg: str):
+    try:
+        os.makedirs(_LOG_DIR, exist_ok=True)
+        ts = __import__('datetime').datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}][PID={os.getpid()}] {msg}\n"
+        with _LOG_LOCK:
+            with open(os.path.join(_LOG_DIR, "uninstaller.log"), "a", encoding="utf-8") as lf:
+                lf.write(line)
+                lf.flush()
+                os.fsync(lf.fileno())
+    except Exception:
+        pass
+_ulog(f"=== START === GAME_DIR={GAME_DIR} frozen={getattr(sys, 'frozen', False)} argv={sys.argv} cwd={os.getcwd()} ===")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -34,16 +59,20 @@ def _cleanup_from_manifest():
         Empty list = everything was deleted, or manifest was missing.
     """
     locked = []
+    _ulog(f"_cleanup_from_manifest: checking {MANIFEST_PATH}")
     if not os.path.isfile(MANIFEST_PATH):
+        _ulog("_cleanup_from_manifest: manifest NOT FOUND")
         return locked
 
     try:
         with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
             manifest = json.load(f)
-    except Exception:
+    except Exception as e:
+        _ulog(f"_cleanup_from_manifest: failed to read manifest: {e}")
         return locked
 
     items = manifest.get("items", [])
+    _ulog(f"_cleanup_from_manifest: {len(items)} items in manifest")
     if not items:
         return locked
 
@@ -58,13 +87,16 @@ def _cleanup_from_manifest():
             file_items.append(item)
         # else: already deleted, or never existed — skip
 
+    _ulog(f"_cleanup_from_manifest: {len(file_items)} files + {len(dir_items)} dirs to delete")
     # Phase A: delete individual files first
     for item in file_items:
         path = os.path.join(GAME_DIR, item)
         try:
             os.remove(path)
-        except OSError:
+        except OSError as e:
+            _ulog(f"_cleanup_from_manifest: LOCKED file: {path}  err={e}")
             locked.append(path)
+    _ulog(f"_cleanup_from_manifest: Phase A done, {len(locked)} files locked")
 
     # Phase B: delete directories (deepest first so children go before parents)
     dir_items.sort(key=lambda d: d.replace("\\", "/").count("/"), reverse=True)
@@ -186,9 +218,15 @@ def _collect_residual_patterns():
     is_injected = (
         _is_nuitka_installation()
         or os.path.isfile(os.path.join(GAME_DIR, "ElushaInjector.exe"))
+        or os.path.isfile(os.path.join(GAME_DIR, "UninstallElusha.exe"))
         or os.path.isdir(os.path.join(GAME_DIR, "_internal"))
     )
+    _ulog(f"_collect_residual_patterns: is_injected={is_injected} "
+          f"(nuitka={_is_nuitka_installation()} injector_exe={os.path.isfile(os.path.join(GAME_DIR, 'ElushaInjector.exe'))} "
+          f"uninstaller_exe={os.path.isfile(os.path.join(GAME_DIR, 'UninstallElusha.exe'))} "
+          f"internal_dir={os.path.isdir(os.path.join(GAME_DIR, '_internal'))})")
     if not is_injected:
+        _ulog("_collect_residual_patterns: not injected, returning empty")
         return paths
 
     # Scan for injector patterns (broader than fallback — catches everything)
@@ -228,10 +266,15 @@ def _schedule_residual_cleanup(paths):
     The batch loops until every file/directory is gone, then self-destructs.
     Uses TEMP so it won't be blocked by game-directory file locks.
     """
+    _ulog(f"_schedule_residual_cleanup: {len(paths)} paths to clean")
+    for p in paths:
+        _ulog(f"  batch_target: {p}")
     if not paths:
+        _ulog("_schedule_residual_cleanup: empty, skipping")
         return
 
     bat_path = os.path.join(os.environ.get("TEMP", "."), "_elu_cleanup.bat")
+    _ulog(f"_schedule_residual_cleanup: writing batch to {bat_path}")
     with open(bat_path, "w") as f:
         f.write("@echo off\r\n"
                 "setlocal enabledelayedexpansion\r\n"
@@ -258,12 +301,49 @@ def _schedule_residual_cleanup(paths):
 #  Main uninstall logic
 # ═══════════════════════════════════════════════════════════════
 
-def uninstall(keep_elsmod_data: bool, keep_plugins: bool):
-    """Three-layer cleanup:
-    1. Manifest-driven deletion (comprehensive, from build)
-    2. Dynamic fallback (pattern scan, if manifest missing)
-    3. Residual: collected later by _collect_residual_patterns + batch
+def _cleanup_elsmod_registry():
+    """Remove .elsmod ProgID association registered by the injector (HKCU Classes only).
+
+    Failure is non-critical — the caller wraps this in try/except to ensure
+    registry issues never block file cleanup.
     """
+    _ulog("_cleanup_elsmod_registry: start")
+    ELSMOD_PROGID = "ElushaPlugin.elsmod"
+
+    # .elsmod → ProgID
+    try:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, r"Software\Classes\.elsmod")
+        _ulog("_cleanup_elsmod_registry: deleted .elsmod key")
+    except OSError as e:
+        _ulog(f"_cleanup_elsmod_registry: .elsmod key skip ({e})")
+
+    # ProgID tree (DefaultIcon, shell/open/command, shell/open, shell)
+    for sub in [
+        rf"Software\Classes\{ELSMOD_PROGID}\shell\open\command",
+        rf"Software\Classes\{ELSMOD_PROGID}\shell\open",
+        rf"Software\Classes\{ELSMOD_PROGID}\shell",
+        rf"Software\Classes\{ELSMOD_PROGID}\DefaultIcon",
+        rf"Software\Classes\{ELSMOD_PROGID}",
+    ]:
+        try:
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, sub)
+            _ulog(f"_cleanup_elsmod_registry: deleted {sub}")
+        except OSError as e:
+            _ulog(f"_cleanup_elsmod_registry: skip {sub} ({e})")
+
+    _ulog("_cleanup_elsmod_registry: calling SHChangeNotify")
+    try:
+        ctypes.windll.shell32.SHChangeNotify(0x08000000, 0, None, None)
+        _ulog("_cleanup_elsmod_registry: SHChangeNotify done")
+    except Exception as e:
+        _ulog(f"_cleanup_elsmod_registry: SHChangeNotify error ({e})")
+
+    _ulog("_cleanup_elsmod_registry: end")
+
+
+def uninstall(keep_elsmod_data: bool, keep_plugins: bool):
+    """Three-layer cleanup. Returns list of locked paths for batch cleanup."""
+    _ulog(f"uninstall: keep_elsmod_data={keep_elsmod_data} keep_plugins={keep_plugins}")
 
     # ── Delete plugin files ──
     if not keep_plugins:
@@ -302,37 +382,62 @@ def uninstall(keep_elsmod_data: bool, keep_plugins: bool):
             pass
 
     # ── Layer 1: Manifest-driven (covers 99% of files) ──
+    _ulog("uninstall: Layer 1 — manifest cleanup")
     manifest_locked = _cleanup_from_manifest()
+    _ulog(f"uninstall: Layer 1 done — {len(manifest_locked)} locked: {[os.path.basename(p) for p in manifest_locked]}")
 
     # ── Layer 2: Dynamic fallback (only when manifest missing) ──
     if not manifest_locked and not os.path.isfile(MANIFEST_PATH):
+        _ulog("uninstall: Layer 2 — dynamic fallback (manifest missing, nothing locked)")
         _cleanup_dynamic_fallback()
-    # Note: when manifest IS present, locked files from it are already
-    # in manifest_locked — they'll be handled by batch cleanup.
+    else:
+        _ulog(f"uninstall: Layer 2 — skipped (manifest_locked={len(manifest_locked)}, manifest_exists={os.path.isfile(MANIFEST_PATH)})")
 
     # ── ElushaInstaller.exe (PyInstaller, not in Nuitka manifest) ──
+    _ulog("uninstall: deleting ElushaInstaller.exe if present")
     installer = os.path.join(GAME_DIR, "ElushaInstaller.exe")
     if os.path.isfile(installer):
         try:
             os.remove(installer)
+            _ulog("uninstall: ElushaInstaller.exe deleted")
         except OSError:
-            pass
+            manifest_locked.append(installer)
+            _ulog(f"uninstall: ElushaInstaller.exe LOCKED")
 
     # ── Clean up elsmod_data ──
+    _ulog(f"uninstall: elsmod_data cleanup — keep_elsmod_data={keep_elsmod_data}")
     if not keep_elsmod_data:
         elsmod_dir = os.path.join(GAME_DIR, "elsmod_data")
+        _ulog(f"uninstall: elsmod_dir={elsmod_dir} isdir={os.path.isdir(elsmod_dir)}")
         if os.path.isdir(elsmod_dir):
-            shutil.rmtree(elsmod_dir, ignore_errors=True)
+            try:
+                shutil.rmtree(elsmod_dir, ignore_errors=True)
+                _ulog("uninstall: elsmod_data rmtree done")
+            except Exception as _e:
+                _ulog(f"uninstall: elsmod_data rmtree ERROR: {type(_e).__name__}: {_e}")
+
+    # ── Clean up .elsmod registry association (non-critical) ──
+    _ulog("uninstall: cleaning up .elsmod registry")
+    try:
+        _cleanup_elsmod_registry()
+        _ulog("uninstall: registry cleanup done")
+    except Exception as _e:
+        _ulog(f"uninstall: registry cleanup ERROR: {type(_e).__name__}: {_e}")
 
     # ── Clean up empty directories left behind ──
+    _ulog("uninstall: cleaning up empty directories")
     for d in [PLUGINS_DIR, os.path.join(GAME_DIR, "www", "js"),
               os.path.join(GAME_DIR, "www")]:
         if os.path.isdir(d):
             try:
                 if not os.listdir(d):
                     os.rmdir(d)
-            except OSError:
-                pass
+                    _ulog(f"uninstall: removed empty dir {d}")
+            except OSError as _e:
+                _ulog(f"uninstall: empty dir cleanup skipping {d}: {_e}")
+
+    _ulog(f"uninstall: RETURNING manifest_locked={[os.path.basename(p) for p in manifest_locked]}")
+    return manifest_locked
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -371,18 +476,37 @@ def main():
     btn_f.pack(pady=20)
 
     def _do_uninstall():
+        _ulog("_do_uninstall: button clicked")
         try:
-            uninstall(keep_elsmod.get(), keep_plugins.get())
+            locked = uninstall(keep_elsmod.get(), keep_plugins.get())
         except Exception as e:
+            _ulog(f"_do_uninstall: ERROR: {e}")
             messagebox.showerror("错误", str(e))
             return
         messagebox.showinfo("完成", "艾露莎注入器已卸载。")
 
         # Collect remaining injector-looking files (locked by this process)
         # and schedule batch cleanup after exit.
-        residual = _collect_residual_patterns()
-        root.destroy()
-        _schedule_residual_cleanup(residual)
+        # Each step wrapped individually — batch cleanup MUST run regardless.
+        locked = locked if isinstance(locked, list) else []
+        _ulog(f"_do_uninstall: manifest_locked={len(locked)} paths")
+        residual = []
+        try:
+            residual = _collect_residual_patterns()
+            _ulog(f"_do_uninstall: residual_patterns={len(residual)} paths")
+        except Exception as _e2:
+            _ulog(f"_do_uninstall: _collect_residual_patterns CRASHED: {type(_e2).__name__}: {_e2}")
+        all_locked = locked + [p for p in residual if p not in locked]
+        _ulog(f"_do_uninstall: combined={len(all_locked)} paths for batch cleanup")
+        try:
+            _schedule_residual_cleanup(all_locked)
+            _ulog("_do_uninstall: batch cleanup SCHEDULED")
+        except Exception as _e3:
+            _ulog(f"_do_uninstall: _schedule_residual_cleanup CRASHED: {type(_e3).__name__}: {_e3}")
+        try:
+            root.destroy()
+        except Exception:
+            pass
 
     ttk.Button(btn_f, text="确认卸载", command=_do_uninstall).pack(
         side=tk.LEFT, padx=8)

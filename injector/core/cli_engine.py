@@ -8,6 +8,23 @@ from typing import Optional
 
 from . import registry, elsmod, installer, deploy, dependency
 
+# ── inline logger (no external deps) ──
+def _get_log_dir():
+    exe_path = sys.executable if getattr(sys, 'frozen', False) else sys.argv[0]
+    return os.path.join(os.path.dirname(os.path.abspath(exe_path)), "elsmod_data", "logs")
+
+def _clog(msg: str):
+    try:
+        d = _get_log_dir()
+        os.makedirs(d, exist_ok=True)
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(os.path.join(d, "cli_engine.log"), "a", encoding="utf-8") as f:
+            f.write(f"[{ts}][PID={os.getpid()}] {msg}\n")
+    except Exception:
+        pass
+_clog(f"=== START === exe={sys.executable} argv={sys.argv} cwd={os.getcwd()} frozen={getattr(sys, 'frozen', False)} ===")
+
 
 def _game_dir() -> str:
     """Detect game directory. Tries: argv[0] path, executable dir, then CWD."""
@@ -25,9 +42,12 @@ def _game_dir() -> str:
     # Fallbacks: CWD, then parent of executable dir
     for candidate in [d, os.getcwd(),
                       os.path.dirname(os.path.abspath(sys.argv[0]))]:
+        _clog(f"_game_dir: trying candidate={candidate}  is_game_dir={deploy.is_game_directory(candidate)}")
         if deploy.is_game_directory(candidate):
+            _clog(f"_game_dir: MATCH → {candidate}")
             return candidate
 
+    _clog("_game_dir: NO MATCH — raising SystemExit")
     raise SystemExit("错误：当前目录不包含 Game.exe。请将程序放到游戏目录下运行。")
 
 
@@ -167,10 +187,13 @@ def cmd_disable(name: str, author: Optional[str] = None) -> dict:
 
 def cmd_install(elsmod_path: str) -> dict:
     """Install a plugin from elsmod."""
+    _clog(f"cmd_install: elsmod_path={elsmod_path}")
     gd = _game_dir()
+    _clog(f"cmd_install: game_dir={gd}")
     if not os.path.isfile(elsmod_path):
         raise FileNotFoundError(f"文件不存在：{elsmod_path}")
     rec = installer.install(gd, elsmod_path)
+    _clog(f"cmd_install: installed {rec['name']} v{rec['version']}")
     return {"installed": rec["name"], "version": rec["version"], "author": rec.get("author", "")}
 
 
@@ -354,6 +377,7 @@ def cmd_reorder(order: list[str]) -> dict:
 def cmd_launch(skip_plugins: bool = False, exe_name: str = None) -> dict:
     """Launch game. If exe_name is given, use it directly. Otherwise detect Game.exe/nw.exe."""
     gd = _game_dir()
+    _clog(f"cmd_launch: game_dir={gd} exe_name={exe_name} skip_plugins={skip_plugins}")
     if exe_name:
         exe = os.path.join(gd, exe_name)
         if not os.path.isfile(exe):
@@ -372,9 +396,16 @@ def cmd_launch(skip_plugins: bool = False, exe_name: str = None) -> dict:
         else:
             raise FileNotFoundError("未找到可执行文件 (Game.exe 或 nw.exe)")
 
-    # Launch Game.exe via explorer (ShellExecute) — fully separate process tree.
-    # subprocess.Popen keeps Game.exe as child → Enigma anti-tamper can see parent.
-    os.startfile(exe)
+    # Launch via ShellExecuteW with explicit working directory.
+    # os.startfile() passes NULL lpDirectory → new process inherits
+    # calling process CWD. When injector was launched via .elsmod file
+    # association, CWD is the .elsmod file's directory (NOT the game dir).
+    # The bootstrap template uses process.cwd() for ALL file paths, so the
+    # game MUST start with the game directory as its CWD.
+    import ctypes
+    _clog(f"cmd_launch: ShellExecuteW(open, {os.path.basename(exe)}, lpDirectory={gd})")
+    ctypes.windll.shell32.ShellExecuteW(None, "open", exe, None, gd, 1)
+    _clog("cmd_launch: game launched")
     return {"launched": True, "mode": mode, "skipPlugins": skip_plugins}
 
 
@@ -406,6 +437,7 @@ def cmd_tools_list() -> list[dict]:
 def _sync_enabled_plugins(game_dir: str):
     """Sync plugins to game: write injector_config.json (packed) or edit plugins.js (unpacked)."""
     from . import registry, injector_config
+    _clog(f"_sync_enabled_plugins: game_dir={game_dir}")
     mode = deploy.game_mode(game_dir)
     reg = registry.load(game_dir)
     load_order = reg.get("loadOrder", [])
@@ -413,20 +445,24 @@ def _sync_enabled_plugins(game_dir: str):
     for rec in reg.get("records", []):
         if rec.get("enabled", False):
             enabled.add(rec["name"])
+    _clog(f"_sync_enabled_plugins: mode={mode} enabled={list(enabled)} load_order={load_order}")
 
     if mode == "packed":
         cfg = injector_config.load(game_dir)
+        _clog(f"_sync_enabled_plugins: loaded config — injection_mode={cfg.get('injection_mode')} redirects={cfg.get('redirects')} plugins_before={cfg.get('plugins')}")
         # Update plugins list
         cfg["plugins"] = [n for n in load_order if n in enabled]
 
         # If bootstrap mode and no redirects exist, add a default one
         if cfg.get("injection_mode") == "bootstrap" and not cfg.get("redirects"):
+            _clog("_sync_enabled_plugins: adding default redirect (EventInformation.js → EventInformation_bootstrap.js)")
             cfg["redirects"] = [
                 {"target": "EventInformation.js",
                  "source": "EventInformation_bootstrap.js"}
             ]
 
         injector_config.save(game_dir, cfg)
+        _clog(f"_sync_enabled_plugins: config saved — plugins={cfg['plugins']} redirects={cfg.get('redirects')}")
 
         # Generate bootstrap files + copy originals
         plugin_files = {}
@@ -434,9 +470,12 @@ def _sync_enabled_plugins(game_dir: str):
             if rec.get("enabled", False):
                 name = rec["name"]
                 plugin_files[name] = f"www/js/plugins/{name}.js"
+        _clog(f"_sync_enabled_plugins: generating bootstraps for {list(plugin_files.keys())}")
         # Try to copy originals from unpacked game or existing originals
-        deploy._ensure_originals(game_dir, cfg)
-        deploy._generate_bootstraps(game_dir, cfg, plugin_files)
+        originals = deploy._ensure_originals(game_dir, cfg)
+        _clog(f"_sync_enabled_plugins: _ensure_originals → {len(originals)} files")
+        bootstraps = deploy._generate_bootstraps(game_dir, cfg, plugin_files)
+        _clog(f"_sync_enabled_plugins: _generate_bootstraps → {len(bootstraps)} files: {[os.path.basename(b) for b in bootstraps]}")
 
         # Also write enabled_plugins.txt for backward compatibility
         path = os.path.join(game_dir, "elsmod_data", "enabled_plugins.txt")

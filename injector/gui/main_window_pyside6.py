@@ -1,6 +1,23 @@
 """PySide6 GUI — 18 themes, i18n, drag-drop, auto-register"""
 import os, sys, webbrowser
 
+# ── inline logger (no external deps) ──
+def _get_log_dir():
+    exe_path = sys.executable if getattr(sys, 'frozen', False) else sys.argv[0]
+    return os.path.join(os.path.dirname(os.path.abspath(exe_path)), "elsmod_data", "logs")
+
+def _glog(msg: str):
+    try:
+        d = _get_log_dir()
+        os.makedirs(d, exist_ok=True)
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(os.path.join(d, "gui.log"), "a", encoding="utf-8") as f:
+            f.write(f"[{ts}][PID={os.getpid()}] {msg}\n")
+    except Exception:
+        pass
+_glog(f"=== START === exe={sys.executable} argv={sys.argv} cwd={os.getcwd()} frozen={getattr(sys, 'frozen', False)} ===")
+
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QCheckBox, QFileDialog,
     QMessageBox, QDialog, QFormLayout, QTabWidget, QTextEdit, QLineEdit, QInputDialog,
@@ -75,19 +92,27 @@ class MainWindow(QMainWindow):
     def __init__(self, dev_mode: bool = False):
         super().__init__()
         self._dev_mode = dev_mode
-        # PyInstaller --onefile: sys.argv[0] = real exe path, sys.executable = TEMP
-        try: exe_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-        except Exception: exe_dir = os.getcwd()
-        self._game_dir = exe_dir if deploy.is_game_directory(exe_dir) else os.getcwd()
+        # Use centralized game-dir detection — same as CLI engine.
+        # Avoids subtle divergence when launched via file association
+        # (where os.getcwd() can differ from the EXE directory).
+        from ..core.cli_engine import _game_dir as _detect_game_dir
+        try:
+            self._game_dir = _detect_game_dir()
+        except SystemExit:
+            self._game_dir = os.getcwd()
+        _glog(f"MainWindow.__init__: _game_dir={self._game_dir} is_game_dir={deploy.is_game_directory(self._game_dir)} cwd={os.getcwd()}")
         self._settings_dlg = None
 
         if not deploy.is_game_directory(self._game_dir):
+            _glog("MainWindow.__init__: NOT a game directory — aborting")
             QMessageBox.critical(None, "Error",
                                  "当前目录不包含 Game.exe 或 nw.exe。\n请将本程序放到游戏目录下运行。")
             sys.exit(1)
 
         self._mode = deploy.game_mode(self._game_dir)
+        _glog(f"MainWindow.__init__: game mode={self._mode}  calling deploy.setup()")
         deploy.setup(self._game_dir)
+        _glog("MainWindow.__init__: deploy.setup() done")
         self._cfg = load_config(self._game_dir)
         self._lang = self._cfg.get("lang", "zh")
         self._theme = self._cfg.get("theme", "slate_gray")
@@ -96,11 +121,14 @@ class MainWindow(QMainWindow):
         mode_label = {"packed": "打包版", "unpacked": "解包版"}.get(self._mode, "未知")
         self._mode_str = mode_label
 
-        # Auto-register .elsmod
-        try:
-            from ..core import elsmod_register
-            elsmod_register.register()
-        except Exception: pass
+        # Auto-register .elsmod (frozen/compiled EXE only)
+        import sys as _sys
+        if getattr(_sys, 'frozen', False):
+            try:
+                from ..core import elsmod_register
+                elsmod_register.register()
+            except Exception:
+                pass
 
         self._t = lambda key: tr(self._lang, key)
         self.setWindowTitle(self._t("app.title"))
@@ -320,15 +348,29 @@ class MainWindow(QMainWindow):
 
     def _on_launch(self):
         exe_name = self._exe_combo.currentText()
+        _glog(f"_on_launch: exe_name={exe_name} game_dir={self._game_dir}")
         if not exe_name:
             QMessageBox.warning(self, "", "未找到可执行文件，请检查游戏目录")
             return
         # remember choice
         self._cfg["game_exe"] = exe_name
         save_config(self._game_dir, self._cfg)
+
+        # Ensure plugin config is synced before launching (belt-and-suspenders:
+        # _refresh() already synced at startup, but state can drift).
+        from ..core.cli_engine import _sync_enabled_plugins
+        _glog("_on_launch: calling _sync_enabled_plugins before launch")
+        _sync_enabled_plugins(self._game_dir)
+        _glog("_on_launch: _sync_enabled_plugins done")
+
         _cli_log(f"> launch \"{exe_name}\" (cwd={self._game_dir})")
-        try: cli_engine.cmd_launch(exe_name=exe_name); self._check_game_running()
-        except Exception as e: QMessageBox.critical(self, "Error", str(e))
+        try:
+            cli_engine.cmd_launch(exe_name=exe_name)
+            _glog("_on_launch: cmd_launch succeeded")
+            self._check_game_running()
+        except Exception as e:
+            _glog(f"_on_launch: cmd_launch FAILED: {type(e).__name__}: {e}")
+            QMessageBox.critical(self, "Error", str(e))
 
     def _on_detail(self, name):
         try:

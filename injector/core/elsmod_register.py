@@ -1,37 +1,42 @@
-""".elsmod file association — Windows registry (HKCU, no admin required)"""
+""".elsmod file association — Windows registry (HKCU, no admin required)
+
+Standard approach:
+  - Only register in frozen mode (compiled EXE).  Dev mode has no
+    real executable to associate — sys.executable would point to python.exe.
+  - The EXE path comes from sys.executable (Nuitka) or sys.argv[0] (PyInstaller).
+  - UserChoice (Windows 8+ hash) is deleted on a best-effort basis.
+"""
+
 import ctypes
 import os
 import sys
 import winreg
 
-
 ELSMOD_PROGID = "ElushaPlugin.elsmod"
 
 
-def _get_exe_path() -> str:
-    """Get the absolute path to this executable.
+def _is_frozen() -> bool:
+    return bool(getattr(sys, 'frozen', False))
 
-    Handles PyInstaller (sys.executable is in TEMP, use sys.argv[0]),
-    Nuitka (sys.executable is the actual EXE), and dev mode.
-    Always returns an absolute path regardless of CWD or launch method."""
-    if getattr(sys, 'frozen', False):
-        if hasattr(sys, '_MEIPASS'):
-            # PyInstaller: sys.executable is the bootloader in TEMP
-            # sys.argv[0] is the real EXE path
-            return os.path.abspath(sys.argv[0])
-        # Nuitka: sys.executable IS the compiled EXE — always reliable
-        return os.path.abspath(sys.executable)
-    # Dev mode: use the Python interpreter
+
+def _get_exe_path() -> str:
+    """Return the absolute path to the compiled EXE, or '' in dev mode."""
+    if not _is_frozen():
+        return ""
+    if hasattr(sys, '_MEIPASS'):
+        # PyInstaller: sys.executable is the temp bootloader
+        return os.path.abspath(sys.argv[0])
+    # Nuitka: sys.executable IS the real EXE
     return os.path.abspath(sys.executable)
 
 
 def register():
-    """Register .elsmod -> ElushaInjector.exe association."""
+    """Register .elsmod -> ElushaInjector.exe.  No-op in dev mode."""
     exe_path = _get_exe_path()
+    if not exe_path:
+        return  # dev mode — nothing to associate
 
-    # Remove UserChoice hash (Windows 8+) that locks the association
-    # when the user previously set a default via "Open with". Without this,
-    # the HKCU Classes keys below have no effect.
+    # Best-effort: clear UserChoice hash that locks a previous "Open with"
     try:
         key = winreg.OpenKey(
             winreg.HKEY_CURRENT_USER,
@@ -39,10 +44,10 @@ def register():
             0, winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE)
         try:
             winreg.DeleteValue(key, "UserChoice")
-        except FileNotFoundError:
+        except OSError:
             pass
         winreg.CloseKey(key)
-    except FileNotFoundError:
+    except OSError:
         pass
 
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
@@ -57,36 +62,44 @@ def register():
                           rf"Software\Classes\{ELSMOD_PROGID}\shell\open\command") as k:
         winreg.SetValue(k, "", winreg.REG_SZ, f'"{exe_path}" "%1"')
 
-    # Notify system
     ctypes.windll.shell32.SHChangeNotify(0x08000000, 0, None, None)
 
 
 def unregister():
-    """Remove .elsmod association."""
-    # Clean HKCU Classes
+    """Remove the .elsmod association (Classes + FileExts)."""
+    # HKCU Classes
     try:
         winreg.DeleteKey(winreg.HKEY_CURRENT_USER, r"Software\Classes\.elsmod")
-    except FileNotFoundError:
-        pass
-    try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                             rf"Software\Classes\{ELSMOD_PROGID}",
-                             0, winreg.KEY_READ)
-        winreg.CloseKey(key)
-        winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
-                         rf"Software\Classes\{ELSMOD_PROGID}\shell\open\command")
-        winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
-                         rf"Software\Classes\{ELSMOD_PROGID}\shell\open")
-        winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
-                         rf"Software\Classes\{ELSMOD_PROGID}\shell")
-        winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
-                         rf"Software\Classes\{ELSMOD_PROGID}\DefaultIcon")
-        winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
-                         rf"Software\Classes\{ELSMOD_PROGID}")
-    except FileNotFoundError:
+    except OSError:
         pass
 
-    # Clean FileExts (UserChoice + OpenWithProgids)
+    try:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
+                         rf"Software\Classes\{ELSMOD_PROGID}\shell\open\command")
+    except OSError:
+        pass
+    try:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
+                         rf"Software\Classes\{ELSMOD_PROGID}\shell\open")
+    except OSError:
+        pass
+    try:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
+                         rf"Software\Classes\{ELSMOD_PROGID}\shell")
+    except OSError:
+        pass
+    try:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
+                         rf"Software\Classes\{ELSMOD_PROGID}\DefaultIcon")
+    except OSError:
+        pass
+    try:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
+                         rf"Software\Classes\{ELSMOD_PROGID}")
+    except OSError:
+        pass
+
+    # FileExts (UserChoice etc.)
     try:
         key = winreg.OpenKey(
             winreg.HKEY_CURRENT_USER,
@@ -94,12 +107,12 @@ def unregister():
             0, winreg.KEY_SET_VALUE)
         try:
             winreg.DeleteValue(key, "UserChoice")
-        except FileNotFoundError:
+        except OSError:
             pass
         try:
             winreg.DeleteValue(key, "Application")
-        except FileNotFoundError:
+        except OSError:
             pass
         winreg.CloseKey(key)
-    except FileNotFoundError:
+    except OSError:
         pass

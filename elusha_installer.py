@@ -890,27 +890,15 @@ class InstallerWizard(tk.Tk):
             except Exception:
                 pass  # non-critical
 
-            # Register .elsmod file association to the installed injector
+            # Register .elsmod file association to the installed injector.
+            # Note: we do NOT delete UserChoice here — Windows would show a
+            # security prompt. The injector handles that on startup instead.
             try:
                 import ctypes
                 import winreg
                 ELSMOD_PROGID = "ElushaPlugin.elsmod"
                 exe_path = os.path.join(game_dir, "ElushaInjector.exe")
                 if os.path.isfile(exe_path):
-                    # Remove UserChoice hash (Windows 8+) that blocks the
-                    # association when user previously set a default app.
-                    try:
-                        uc_key = winreg.OpenKey(
-                            winreg.HKEY_CURRENT_USER,
-                            r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.elsmod",
-                            0, winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE)
-                        try:
-                            winreg.DeleteValue(uc_key, "UserChoice")
-                        except FileNotFoundError:
-                            pass
-                        winreg.CloseKey(uc_key)
-                    except FileNotFoundError:
-                        pass
                     with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
                                           r"Software\Classes\.elsmod") as k:
                         winreg.SetValue(k, "", winreg.REG_SZ, ELSMOD_PROGID)

@@ -1,6 +1,8 @@
 # 艾露莎注入器 (Elusha Injector) v1.0
 
 > 为 EnigmaVB 打包的《世間知らずの猫エルーシャ》提供运行时插件加载。**不需要解包，不需要修改 Game.exe。**
+>
+> ✅ `.elsmod` 文件关联 | ✅ 3 层卸载清理 | ✅ 3 语言 (zh/en/ja) | ✅ 19 主题 | ✅ CLI 工具链
 
 ---
 
@@ -8,7 +10,7 @@
 
 ### 安装
 
-1. 下载 `ElushaInstaller.exe`（约 50MB，唯一需要的文件）
+1. 下载 `ElushaInstaller.exe`（约 50-100MB，唯一需要的文件）
 2. 双击运行 → 多页面向导：选择语言 → 选择游戏程序（`Game.exe` / `nw.exe` / 其他）→ 确认安装信息
 3. 点击「安装」→ 进度条显示复制进度 → 注入器释放到游戏目录
 4. 安装完成后可选择删除安装器
@@ -36,7 +38,7 @@
 - 保留已下载的插件（保留 `elsmod_data/`）
 - 保留已加载的插件（保留 `www/js/plugins/`）
 
-卸载器会删除所有注入器文件（EXE、DLL、pyd、运行库目录）、`version.dll`、`ElushaInstaller.exe` 及 bootstrap 文件。自身进程锁定的文件通过延迟批处理在退出后清理。
+卸载器会删除所有注入器文件（EXE、DLL、pyd、运行库目录）、`version.dll`、`ElushaInstaller.exe` 及 bootstrap 文件。采用三层清理（Manifest → 模式匹配 → 批处理），自身进程锁定的文件通过延迟批处理在退出后循环删除。
 
 ---
 
@@ -165,8 +167,10 @@ Game.exe 启动
 - **version.dll 不代理 version API**：导出返回 0。不需要版本信息，避免残留进程
 - **Bootstrap = CreateFileW 重定向 + fs+eval**：小型加载器（<250B）替换目标 JS，原版放 `originals/` 备份
 - **MinHook 永久 trampoline**：消除 P5/U5 与 Enigma Hook 的竞态，100% 可靠
-- **一键安装**：`ElushaInstaller.exe` 多页向导，选游戏目录即可部署
-- **混合打包**：Nuitka 编译游戏目录组件（避免 EnigmaVB 检测），PyInstaller 打包安装器（成熟稳定）
+- **ShellExecuteW 显式 lpDirectory**：替代 `os.startfile()`，确保游戏进程 CWD 正确——Bootstrap 依赖 `process.cwd()`
+- **三层卸载清理**：Manifest 精确删除 + 模式匹配兜底 + 批处理清理进程锁定文件
+- **Nuitka standalone** 编译游戏目录组件（避开 EnigmaVB 对 PyInstaller bootloader 的检测）
+- **PyInstaller onefile** 打包安装器（成熟稳定，不接触游戏进程）
 
 ### 技术栈
 
@@ -185,16 +189,18 @@ Game.exe 启动
 ├── ElushaInstaller.exe          ← 安装器（可选保留）
 ├── ElushaInjector.exe           ← 注入器 GUI（Nuitka standalone）
 ├── UninstallElusha.exe          ← 卸载器（Nuitka standalone, tkinter）
-├── python310.dll                ← Nuitka 运行时（散落文件）
+├── python310.dll                ← Nuitka 运行时（flat 布局）
 ├── *.pyd / *.dll                ← Nuitka 运行时模块
 ├── PySide6/ shiboken6/          ← Qt 库目录
 ├── tcl/ tk/ tcl8/               ← Tcl/Tk 运行时（卸载器依赖）
 ├── injector/                    ← 嵌入资源（图标等）
 ├── version.dll                  ← 注入 DLL（MinHook）
-├── elsmod_data/                 ← 插件存储 + 注册表 + 配置
+├── elsmod_data/                 ← 插件存储 + 注册表 + 配置 + 日志
 │   ├── registry.json            ← 注册表
 │   ├── injector_config.json     ← 注入策略配置
+│   ├── install_manifest.json    ← 安装清单
 │   ├── ui_config.json           ← GUI 配置（语言、主题、选中 exe）
+│   ├── logs/                    ← 诊断日志
 │   └── *.elsmod                 ← 插件源文件
 └── www/js/plugins/              ← 已安装插件
 ```

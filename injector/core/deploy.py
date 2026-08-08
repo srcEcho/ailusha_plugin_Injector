@@ -2,13 +2,31 @@
 import os
 import shutil
 import sys
-from . import injector_config
+from . import injector_config, registry
+
+# ── inline logger (no external deps) ──
+def _get_log_dir():
+    exe_path = sys.executable if getattr(sys, 'frozen', False) else sys.argv[0]
+    return os.path.join(os.path.dirname(os.path.abspath(exe_path)), "elsmod_data", "logs")
+
+def _dlog(msg: str):
+    try:
+        d = _get_log_dir()
+        os.makedirs(d, exist_ok=True)
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(os.path.join(d, "deploy.log"), "a", encoding="utf-8") as f:
+            f.write(f"[{ts}][PID={os.getpid()}] {msg}\n")
+    except Exception:
+        pass
+_dlog(f"=== START === exe={sys.executable} argv={sys.argv} cwd={os.getcwd()} frozen={getattr(sys, 'frozen', False)} ===")
 
 REQUIRED_DIRS = [
     "www/js/plugins",
     "www/js/plugins/data",
     "elsmod_data",
     "elsmod_data/tmp",
+    "elsmod_data/logs",
     "elsmod_data/originals/www/js/plugins",
     "elsmod_data/bootstraps",
 ]
@@ -139,9 +157,12 @@ def _ensure_originals(game_dir: str, config: dict) -> list[str]:
     """Copy original game files to originals/ backup for bootstrap.
     Tries unpacked game www/ first, then checks if already copied.
     Returns list of copied paths."""
+    _dlog(f"_ensure_originals: game_dir={game_dir} redirects={config.get('redirects', [])}")
     copied = []
     redirects = config.get("redirects", [])
     if not redirects:
+        _dlog("_ensure_originals: no redirects, returning empty")
+        return copied
         return copied
 
     originals_dir = os.path.join(game_dir, "elsmod_data", "originals", "www", "js", "plugins")
@@ -184,7 +205,9 @@ def _generate_bootstraps(game_dir: str, config: dict, plugin_files: dict[str, st
     created = []
     redirects = config.get("redirects", [])
     plugins = config.get("plugins", [])
+    _dlog(f"_generate_bootstraps: redirects={redirects} plugins={plugins} plugin_files={list(plugin_files.keys())}")
     if not redirects:
+        _dlog("_generate_bootstraps: no redirects, returning empty")
         return created
 
     for rule in redirects:
@@ -215,6 +238,7 @@ def _generate_bootstraps(game_dir: str, config: dict, plugin_files: dict[str, st
 
 def setup(game_dir: str) -> dict:
     """Full environment setup. Returns summary dict."""
+    _dlog(f"setup: game_dir={game_dir}")
     result = {
         "is_game_dir": False,
         "dirs_created": [],
@@ -225,25 +249,32 @@ def setup(game_dir: str) -> dict:
     }
 
     if not is_game_directory(game_dir):
+        _dlog(f"setup: NOT a game directory (no Game.exe or unpacked layout) — aborting")
         result["errors"].append("当前目录不包含 Game.exe")
         return result
 
     result["is_game_dir"] = True
     mode = game_mode(game_dir)
+    _dlog(f"setup: mode={mode}")
 
     # Create directories
     result["dirs_created"] = ensure_directories(game_dir)
 
     # Extract version.dll from embedded base64 (packed mode only)
     if mode == "packed":
+        _dlog("setup: packed mode — extracting version.dll")
         if _extract_dll(game_dir):
+            _dlog("setup: version.dll extracted OK")
             result["files_extracted"].append(os.path.join(game_dir, "version.dll"))
         else:
+            _dlog("setup: version.dll extraction FAILED")
             result["errors"].append("无法解出版本 DLL")
 
         # Generate bootstrap files for bootstrap mode
+        _dlog("setup: generating bootstraps...")
         try:
             cfg = injector_config.load(game_dir)
+            _dlog(f"setup: config loaded — injection_mode={cfg.get('injection_mode')} redirects={cfg.get('redirects')}")
             if cfg.get("injection_mode") == "bootstrap" and cfg.get("redirects"):
                 # Collect plugin file paths from registry
                 plugin_files = {}
@@ -253,18 +284,26 @@ def setup(game_dir: str) -> dict:
                         if rec.get("enabled", False):
                             name = rec["name"]
                             plugin_files[name] = f"www/js/plugins/{name}.js"
-                except Exception:
+                except Exception as e:
+                    _dlog(f"setup: registry read for bootstraps failed: {e}")
                     pass
+                _dlog(f"setup: calling _generate_bootstraps with plugin_files={list(plugin_files.keys())}")
                 bootstraps = _generate_bootstraps(game_dir, cfg, plugin_files)
+                _dlog(f"setup: bootstraps generated: {len(bootstraps)} files: {[os.path.basename(b) for b in bootstraps]}")
                 result["files_extracted"].extend(bootstraps)
+            else:
+                _dlog(f"setup: skipping bootstrap generation (mode={cfg.get('injection_mode')} redirects={cfg.get('redirects')})")
         except Exception as e:
+            _dlog(f"setup: bootstrap generation ERROR: {type(e).__name__}: {e}")
             result["errors"].append(f"Bootstrap 生成失败：{e}")
 
     # Extract embedded files
     try:
         resource_dir = get_resource_dir()
+        _dlog(f"setup: extracting embedded files from resource_dir={resource_dir}")
         result["files_extracted"] = extract_embedded_files(game_dir, resource_dir)
     except Exception as e:
+        _dlog(f"setup: embedded extraction failed: {e}")
         result["errors"].append(f"解出嵌入文件失败：{e}")
 
     # Recover orphans, check integrity
@@ -273,6 +312,8 @@ def setup(game_dir: str) -> dict:
         result["orphans_recovered"] = installer.recover_orphans(game_dir)
         result["broken_plugins"] = installer.check_integrity(game_dir)
     except Exception as e:
+        _dlog(f"setup: orphan/integrity scan failed: {e}")
         result["errors"].append(f"注册表扫描失败：{e}")
 
+    _dlog(f"setup: DONE — errors={result['errors']} files={len(result['files_extracted'])} bootstraps={len([f for f in result['files_extracted'] if '_bootstrap' in f])}")
     return result
