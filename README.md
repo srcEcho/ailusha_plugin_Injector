@@ -67,7 +67,7 @@ PluginName.elsmod
   "version": "1.0.0",
   "author": "YourName",
   "description": "插件简介",
-  "gameVersion": "1.051",
+  "gameVersion": "1.06",
   "dependencies": [],
   "conflicts": []
 }

@@ -5,7 +5,7 @@ import os
 STRINGS = {
     "zh": {
         "app.title": "艾露莎注入器 v1.0",
-        "app.subtitle": "世間知らずの猫エルーシャ 插件管理 · 支持游戏版本 1.051",
+        "app.subtitle": "世間知らずの猫エルーシャ 插件管理 · 支持游戏版本 1.06",
         "btn.close": "关闭",
         "btn.import": "导入",
         "btn.launch": "启动游戏",
@@ -102,7 +102,7 @@ STRINGS = {
     },
     "en": {
         "app.title": "Elusha Injector v1.0",
-        "app.subtitle": "Elusha Plugin Manager · Supports game version 1.051",
+        "app.subtitle": "Elusha Plugin Manager · Supports game version 1.06",
         "btn.close": "Close",
         "btn.import": "Import",
         "btn.launch": "Launch Game",
@@ -199,7 +199,7 @@ STRINGS = {
     },
     "ja": {
         "app.title": "エルーシャインジェクター v1.0",
-        "app.subtitle": "世間知らずの猫エルーシャ プラグイン管理 · v1.051対応",
+        "app.subtitle": "世間知らずの猫エルーシャ プラグイン管理 · v1.06対応",
         "btn.close": "閉じる",
         "btn.import": "インポート",
         "btn.launch": "ゲーム起動",

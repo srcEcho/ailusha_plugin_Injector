@@ -326,7 +326,7 @@ def cmd_template(name: str, author: str, target_dir: str) -> dict:
         "version": "0.1.0",
         "author": author,
         "description": "TODO: plugin description",
-        "gameVersion": "1.051",
+        "gameVersion": "1.06",
         "dependencies": [],
         "conflicts": [],
     }
@@ -380,6 +380,13 @@ def cmd_launch(skip_plugins: bool = False, exe_name: str = None) -> dict:
     """Launch game. If exe_name is given, use it directly. Otherwise detect Game.exe/nw.exe."""
     gd = _game_dir()
     _clog(f"cmd_launch: game_dir={gd} exe_name={exe_name} skip_plugins={skip_plugins}")
+    # Sync before launch — same as the GUI (_on_launch). Without this, CLI-only
+    # users never get injector_config.json/bootstraps/originals, the DLL finds
+    # no redirects and injects nothing.
+    try:
+        _sync_enabled_plugins(gd)
+    except Exception as e:
+        _clog(f"cmd_launch: sync failed, continuing: {type(e).__name__}: {e}")
     if exe_name:
         exe = os.path.join(gd, exe_name)
         if not os.path.isfile(exe):

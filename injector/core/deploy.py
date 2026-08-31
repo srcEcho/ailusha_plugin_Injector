@@ -32,11 +32,11 @@ REQUIRED_DIRS = [
 ]
 
 BOOTSTRAP_TEMPLATE = """(function(){{var f=require('fs'),p=require('path'),b=process.cwd();
-eval(f.readFileSync(p.join(b,'elsmod_data/originals/www/js/plugins/{original}'),'utf8'));
+try{{eval(f.readFileSync(p.join(b,'elsmod_data/originals/www/js/plugins/{original}'),'utf8'));}}catch(e){{}}
 {loaders}
 }})();"""
 
-PLUGIN_LOADER = "eval(f.readFileSync(p.join(b,'{path}'),'utf8'));\n"
+PLUGIN_LOADER = "try{{eval(f.readFileSync(p.join(b,'{path}'),'utf8'));}}catch(e){{}}\n"
 
 EMBEDDED_FILES_PACKED = ["UninstallElusha.exe"]
 EMBEDDED_FILES_UNPACKED = ["UninstallElusha.exe"]
@@ -155,7 +155,8 @@ def get_resource_dir() -> str:
 
 def _ensure_originals(game_dir: str, config: dict) -> list[str]:
     """Copy original game files to originals/ backup for bootstrap.
-    Tries unpacked game www/ first, then checks if already copied.
+    Sources, in order: unpacked game www/, sibling 解包/ dir, project root www/,
+    then the packed Game.exe's own VFS (EnigmaVB, raw files only).
     Returns list of copied paths."""
     _dlog(f"_ensure_originals: game_dir={game_dir} redirects={config.get('redirects', [])}")
     copied = []
@@ -163,37 +164,65 @@ def _ensure_originals(game_dir: str, config: dict) -> list[str]:
     if not redirects:
         _dlog("_ensure_originals: no redirects, returning empty")
         return copied
-        return copied
 
     originals_dir = os.path.join(game_dir, "elsmod_data", "originals", "www", "js", "plugins")
 
+    # Collect all needed filenames first (a single VFS pass covers them all)
+    needed = []
     for rule in redirects:
         target_name = rule.get("target", "")
-        # Extract just the filename
         filename = target_name.replace("\\", "/").split("/")[-1]
-        if not filename:
-            continue
+        if filename:
+            needed.append(filename)
 
+    missing = []
+    for filename in needed:
         dest = os.path.join(originals_dir, filename)
         if os.path.isfile(dest):
             continue  # Already copied
+        missing.append(filename)
 
-        # Try to find the original:
-        # 1. From unpacked game www/ in the same directory
-        # 2. From a sibling 解包/ directory
-        # 3. From project root www/ (for development)
+    # Try to find originals on disk:
+    # 1. From unpacked game www/ in the same directory
+    # 2. From a sibling 解包/ directory
+    # 3. From project root www/ (for development)
+    still_missing = []
+    for filename in missing:
         sources = [
             os.path.join(game_dir, "www", "js", "plugins", filename),
             os.path.join(os.path.dirname(game_dir), "解包", "www", "js", "plugins", filename),
             os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                          "www", "js", "plugins", filename),  # project root www/
         ]
+        done = False
         for src in sources:
             if os.path.isfile(src):
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
-                shutil.copy2(src, dest)
-                copied.append(dest)
+                os.makedirs(originals_dir, exist_ok=True)
+                shutil.copy2(src, os.path.join(originals_dir, filename))
+                copied.append(os.path.join(originals_dir, filename))
+                done = True
                 break
+        if not done:
+            still_missing.append(filename)
+
+    # 4. Extract from the packed game exe's own VFS (EnigmaVB).
+    #    Covers fresh packed installs where no unpacked copy exists on disk —
+    #    the original is read straight out of Game.exe, never pre-prepared.
+    if still_missing:
+        exe_path = os.path.join(game_dir, "Game.exe")
+        if os.path.isfile(exe_path):
+            try:
+                from . import evb_vfs
+                _dlog(f"_ensure_originals: extracting {still_missing} from packed exe VFS")
+                results = evb_vfs.extract_files(exe_path, set(still_missing), originals_dir)
+                for filename, ok in results.items():
+                    if ok:
+                        copied.append(os.path.join(originals_dir, filename))
+                    else:
+                        _dlog(f"_ensure_originals: VFS extract FAILED for {filename} "
+                              f"(missing in VFS or compressed — bootstrap try/catch will skip the original)")
+            except Exception as e:
+                _dlog(f"_ensure_originals: VFS extraction error: {type(e).__name__}: {e}")
 
     return copied
 
