@@ -5,7 +5,7 @@ CONFIG_DIR = "elsmod_data"
 CONFIG_FILENAME = "injector_config.json"
 
 DEFAULTS = {
-    "entry_point": "version_dll",
+    "entry_point": "winhttp_dll",
     "hook_library": "minhook",
     "injection_entry": "readfile",
     "file_passthrough": "createfile_redirect",
@@ -16,7 +16,7 @@ DEFAULTS = {
 
 OPTIONS = {
     "entry_point": [
-        {"value": "version_dll", "label_zh": "version.dll 侧载", "label_en": "version.dll side-load", "label_ja": "version.dll サイドロード"},
+        {"value": "winhttp_dll", "label_zh": "winhttp.dll 侧载", "label_en": "winhttp.dll side-load", "label_ja": "winhttp.dll サイドロード"},
     ],
     "hook_library": [
         {"value": "minhook", "label_zh": "MinHook", "label_en": "MinHook", "label_ja": "MinHook"},
@@ -48,6 +48,9 @@ def load(game_dir: str) -> dict:
         return dict(DEFAULTS)
     merged = dict(DEFAULTS)
     merged.update({k: v for k, v in data.items() if k in DEFAULTS})
+    # Migrate legacy entry_point value (version.dll → winhttp.dll side-load)
+    if merged.get("entry_point") == "version_dll":
+        merged["entry_point"] = "winhttp_dll"
     return merged
 
 

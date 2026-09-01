@@ -424,7 +424,7 @@ def cmd_config() -> dict:
     return {
         "gameDir": gd,
         "hasGameExe": os.path.isfile(os.path.join(gd, "Game.exe")),
-        "hasVersionDll": os.path.isfile(os.path.join(gd, "version.dll")),
+        "hasVersionDll": os.path.isfile(os.path.join(gd, "winhttp.dll")),
         "hasElsmodDir": os.path.isdir(os.path.join(gd, "elsmod_data")),
     }
 
@@ -457,6 +457,12 @@ def _sync_enabled_plugins(game_dir: str):
     _clog(f"_sync_enabled_plugins: mode={mode} enabled={list(enabled)} load_order={load_order}")
 
     if mode == "packed":
+        # Re-extract winhttp.dll if missing. Third-party launchers like MTOOL
+        # delete version.dll (their `从游戏中移除工具文件.bat` runs `del /Q version.dll`,
+        # treating version.dll as a tool-managed file), so we side-load winhttp.dll —
+        # a DLL MTOOL does not manage. Without this self-heal, the next launch
+        # silently has no side-loaded injection DLL.
+        deploy._extract_dll(game_dir)
         cfg = injector_config.load(game_dir)
         _clog(f"_sync_enabled_plugins: loaded config — injection_mode={cfg.get('injection_mode')} redirects={cfg.get('redirects')} plugins_before={cfg.get('plugins')}")
         # Update plugins list

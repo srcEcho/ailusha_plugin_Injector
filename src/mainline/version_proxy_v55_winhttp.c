@@ -1,8 +1,14 @@
 /**
- * v54 Production: MinHook + ReadFile(optional) + CreateFileW(optional)
- * Reads elsmod_data/injector_config.json at init.
+ * v55 winhttp.dll Production: MinHook + ReadFile(optional) + CreateFileW(optional)
  *
- * Config fields:
+ * IDENTICAL to v54, except it ships as **winhttp.dll** instead of version.dll.
+ * Why: third-party launchers like MTOOL delete/overwrite version.dll (and winmm.dll)
+ * for their own side-load injection, so our version.dll is removed and the hook never
+ * fires. The game's unpacked main exe also imports winhttp.dll — a DLL MTOOL does not
+ * manage — so we side-load that instead. All WinHTTP exports are forwarded to the real
+ * System32 winhttp.dll so the game's networking is unchanged.
+ *
+ * Config fields (elsmod_data/injector_config.json):
  *   injection_mode: "bootstrap" | "mainjs_push"
  *   plugins: ["PluginA", "PluginB"]
  *   redirects: [{"target":"www\\js\\plugins\\X.js","source":"X_bootstrap.js"}]
@@ -10,13 +16,15 @@
  * Compile (MSYS2):
  *   gcc -shared -s -Os -static -Wl,--kill-at \
  *     -I src/minhook \
- *     -o version.dll \
- *     src/mainline/version_proxy_v54_production.c \
+ *     -o winhttp.dll \
+ *     src/mainline/version_proxy_v55_winhttp.c \
  *     src/minhook/hde32.c src/minhook/buffer.c \
  *     src/minhook/hook.c src/minhook/trampoline.c \
  *     -lkernel32
  */
 #include <windows.h>
+#define WINHTTPAPI  /* neutralize dllimport so we can dllexport our forwarders */
+#include <winhttp.h>
 #include "MinHook.h"
 
 // ============================================================
@@ -48,14 +56,11 @@ static void ParseJSON(char *buf) {
     g_plugin_count = 0; g_redirect_count = 0; g_mode_bootstrap = 0;
     char *p = buf;
 
-    // injection_mode — mirror the redirects parser: skip past the key (16 chars
-    // including quotes), then past ': ' to the value's opening quote.
     p = strstr(buf, "\"injection_mode\"");
     if (p) { p += 16; p = strchr(p, '"'); if (p) { p++;
         if (memcmp(p, "bootstrap", 9) == 0) g_mode_bootstrap = 1;
     }}
 
-    // plugins array
     p = strstr(buf, "\"plugins\""); if (p) { p = strchr(p + 9, '[');
     if (p) { p++; while (*p && g_plugin_count < MAX_ITEMS) {
         while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',') p++;
@@ -64,7 +69,6 @@ static void ParseJSON(char *buf) {
         if (!p) break; g_plugin_count++;
     }}}
 
-    // redirects array
     p = strstr(buf, "\"redirects\""); if (p) { p = strchr(p + 11, '[');
     if (p) { p++; while (*p && g_redirect_count < MAX_ITEMS) {
         while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',') p++;
@@ -80,8 +84,6 @@ static void ParseJSON(char *buf) {
     }}}}
 }
 
-// Resolve the directory containing the game EXE (independent of CWD).
-// Fills `dir` with the trailing separator; returns 0 on failure.
 static int GetExeDir(WCHAR *dir, int max) {
     WCHAR exe[MAX_PATH];
     DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH);
@@ -97,7 +99,6 @@ static int GetExeDir(WCHAR *dir, int max) {
     return 1;
 }
 
-// Append a decimal int to a wide string (kernel32-only, no CRT/wsprintf).
 static void WCatInt(WCHAR *dst, int v) {
     WCHAR tmp[16]; int n = 0;
     if (v == 0) { tmp[n++] = L'0'; }
@@ -113,9 +114,6 @@ static void WCatInt(WCHAR *dst, int v) {
     }
 }
 
-// Diagnostic log: one line to {exe_dir}\elsmod_data\logs\injector_dll.log.
-// Lets us confirm via third-party launchers (e.g. MTOOL) whether the config was
-// found and how many redirects are active, plus exe_dir vs the process CWD.
 static void DllLogConfig(const WCHAR *exedir, int cfg_found) {
     WCHAR cwd[MAX_PATH], dir[MAX_PATH], logpath[MAX_PATH], msg[1024];
     if (!GetCurrentDirectoryW(MAX_PATH, cwd)) cwd[0] = 0;
@@ -126,6 +124,7 @@ static void DllLogConfig(const WCHAR *exedir, int cfg_found) {
     lstrcatW(msg, L" plugins=");          WCatInt(msg, g_plugin_count);
     lstrcatW(msg, L" mode=");
     lstrcatW(msg, g_mode_bootstrap ? L"bootstrap" : L"mainjs_push");
+    lstrcatW(msg, L" dll=winhttp");
     lstrcatW(msg, L"\r\nexe_dir=");       lstrcatW(msg, exedir);
     lstrcatW(msg, L"\r\ncwd=");           lstrcatW(msg, cwd);
     lstrcatW(msg, L"\r\n");
@@ -145,10 +144,6 @@ static void DllLogConfig(const WCHAR *exedir, int cfg_found) {
     CloseHandle(hf);
 }
 
-// Diagnostic log: one line per CreateFileW redirect (bootstrap mode).
-// Confirms the redirect actually fired — i.e. the game really requested the
-// target file and we swapped it for the bootstrap loader. Includes the PID so
-// the multi-process NW.js load order is visible in the log.
 static void DllLogRedirect(const WCHAR *target, const WCHAR *source) {
     WCHAR exedir[MAX_PATH], dir[MAX_PATH], logpath[MAX_PATH], msg[1024];
     if (!GetExeDir(exedir, MAX_PATH)) return;
@@ -182,9 +177,6 @@ static void LoadConfig(void) {
     WCHAR exedir[MAX_PATH], cfgpath[MAX_PATH];
     if (!GetExeDir(exedir, MAX_PATH)) return;
 
-    // Config path is resolved against the EXE directory (NOT the process CWD), so
-    // injection works no matter how the game was launched — double-click, injector,
-    // or third-party tools like MTOOL that spawn it with a different working dir.
     lstrcpyW(cfgpath, exedir);
     lstrcatW(cfgpath, L"elsmod_data\\injector_config.json");
 
@@ -256,10 +248,8 @@ static void BuildPayload(void) {
 static BOOL WINAPI H_RF(HANDLE hf, LPVOID buf, DWORD nb, LPDWORD lpb, LPOVERLAPPED lo) {
     LoadConfig();
     if (g_mode_bootstrap) {
-        // Bootstrap mode: pass through, no ReadFile modification
         return g_RealRF(hf, buf, nb, lpb, lo);
     }
-    // mainjs_push mode
     BuildPayload();
     BOOL r = g_RealRF(hf, buf, nb, lpb, lo);
     if (g_inject_done || !r || !buf || nb < 80) return r;
@@ -285,6 +275,87 @@ static BOOL WINAPI H_RF(HANDLE hf, LPVOID buf, DWORD nb, LPDWORD lpb, LPOVERLAPP
 }
 
 // ============================================================
+// WinHTTP forwarding — load the real System32 winhttp.dll and
+// forward every export we name, so the game's networking is untouched.
+// ============================================================
+static HMODULE g_realWinhttp = NULL;
+
+static void LoadRealWinhttp(void) {
+    if (g_realWinhttp) return;
+    WCHAR sys[MAX_PATH];
+    if (GetSystemDirectoryW(sys, MAX_PATH)) {
+        lstrcatW(sys, L"\\winhttp.dll");
+        g_realWinhttp = LoadLibraryW(sys);
+    }
+}
+
+#define FORWARD_DEF(name, ret, params, args) \
+    static ret (WINAPI *fp_##name) params = NULL; \
+    __declspec(dllexport) ret WINAPI name params { \
+        if (!fp_##name) { LoadRealWinhttp(); if (g_realWinhttp) \
+            fp_##name = (ret (WINAPI *) params)GetProcAddress(g_realWinhttp, #name); } \
+        if (!fp_##name) { SetLastError(127); return (ret)0; } \
+        return fp_##name args; \
+    }
+
+FORWARD_DEF(WinHttpOpen,
+    HINTERNET, (LPCWSTR a, DWORD b, LPCWSTR c, LPCWSTR d, DWORD e), (a, b, c, d, e))
+FORWARD_DEF(WinHttpConnect,
+    HINTERNET, (HINTERNET a, LPCWSTR b, INTERNET_PORT c, DWORD d), (a, b, c, d))
+FORWARD_DEF(WinHttpOpenRequest,
+    HINTERNET, (HINTERNET a, LPCWSTR b, LPCWSTR c, LPCWSTR d, LPCWSTR e, LPCWSTR FAR *f, DWORD g), (a, b, c, d, e, f, g))
+FORWARD_DEF(WinHttpAddRequestHeaders,
+    BOOL, (HINTERNET a, LPCWSTR b, DWORD c, DWORD d), (a, b, c, d))
+FORWARD_DEF(WinHttpSendRequest,
+    BOOL, (HINTERNET a, LPCWSTR b, DWORD c, LPVOID d, DWORD e, DWORD f, DWORD_PTR g), (a, b, c, d, e, f, g))
+FORWARD_DEF(WinHttpWriteData,
+    BOOL, (HINTERNET a, LPCVOID b, DWORD c, LPDWORD d), (a, b, c, d))
+FORWARD_DEF(WinHttpReadData,
+    BOOL, (HINTERNET a, LPVOID b, DWORD c, LPDWORD d), (a, b, c, d))
+FORWARD_DEF(WinHttpReceiveResponse,
+    BOOL, (HINTERNET a, LPVOID b), (a, b))
+FORWARD_DEF(WinHttpCloseHandle,
+    BOOL, (HINTERNET a), (a))
+FORWARD_DEF(WinHttpQueryHeaders,
+    BOOL, (HINTERNET a, DWORD b, LPCWSTR c, LPVOID d, LPDWORD e, LPDWORD f), (a, b, c, d, e, f))
+FORWARD_DEF(WinHttpCrackUrl,
+    BOOL, (LPCWSTR a, DWORD b, DWORD c, LPURL_COMPONENTS d), (a, b, c, d))
+FORWARD_DEF(WinHttpSetTimeouts,
+    BOOL, (HINTERNET a, int b, int c, int d, int e), (a, b, c, d, e))
+/* nw.dll delay-loads these two — missing them crashed the game (exit 127) */
+FORWARD_DEF(WinHttpGetProxyForUrl,
+    BOOL, (HINTERNET a, LPCWSTR b, WINHTTP_AUTOPROXY_OPTIONS *c, WINHTTP_PROXY_INFO *d), (a, b, c, d))
+FORWARD_DEF(WinHttpGetIEProxyConfigForCurrentUser,
+    BOOL, (WINHTTP_CURRENT_USER_IE_PROXY_CONFIG *a), (a))
+/* Chromium resolves these via GetProcAddress — forward for safety */
+FORWARD_DEF(WinHttpSetStatusCallback,
+    WINHTTP_STATUS_CALLBACK, (HINTERNET a, WINHTTP_STATUS_CALLBACK b, DWORD c, DWORD_PTR d), (a, b, c, d))
+FORWARD_DEF(WinHttpQueryDataAvailable,
+    BOOL, (HINTERNET a, LPDWORD b), (a, b))
+FORWARD_DEF(WinHttpSetOption,
+    BOOL, (HINTERNET a, DWORD b, LPVOID c, DWORD d), (a, b, c, d))
+FORWARD_DEF(WinHttpQueryOption,
+    BOOL, (HINTERNET a, DWORD b, LPVOID c, LPDWORD d), (a, b, c, d))
+FORWARD_DEF(WinHttpQueryAuthSchemes,
+    BOOL, (HINTERNET a, LPDWORD b, LPDWORD c, LPDWORD d), (a, b, c, d))
+FORWARD_DEF(WinHttpGetDefaultProxyConfiguration,
+    BOOL, (WINHTTP_PROXY_INFO *a), (a))
+FORWARD_DEF(WinHttpSetDefaultProxyConfiguration,
+    BOOL, (WINHTTP_PROXY_INFO *a), (a))
+FORWARD_DEF(WinHttpSetCredentials,
+    BOOL, (HINTERNET a, DWORD b, DWORD c, LPCWSTR d, LPCWSTR e, LPVOID f), (a, b, c, d, e, f))
+FORWARD_DEF(WinHttpTimeFromSystemTime,
+    BOOL, (const SYSTEMTIME *a, LPWSTR b), (a, b))
+FORWARD_DEF(WinHttpTimeToSystemTime,
+    BOOL, (LPCWSTR a, SYSTEMTIME *b), (a, b))
+FORWARD_DEF(WinHttpCreateUrl,
+    BOOL, (LPURL_COMPONENTS a, DWORD b, LPWSTR c, LPDWORD d), (a, b, c, d))
+FORWARD_DEF(WinHttpDetectAutoProxyConfigUrl,
+    BOOL, (DWORD a, LPWSTR *b), (a, b))
+FORWARD_DEF(WinHttpCheckPlatform,
+    BOOL, (void), ())
+
+// ============================================================
 // DllMain
 // ============================================================
 BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID p) {
@@ -299,10 +370,3 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID p) {
     }
     return 1;
 }
-
-__declspec(dllexport) BOOL  WINAPI GetFileVersionInfoA(LPCSTR a,DWORD b,DWORD c,LPVOID d)  {return 0;}
-__declspec(dllexport) BOOL  WINAPI GetFileVersionInfoW(LPCWSTR a,DWORD b,DWORD c,LPVOID d){return 0;}
-__declspec(dllexport) DWORD WINAPI GetFileVersionInfoSizeA(LPCSTR a,LPDWORD b)            {return 0;}
-__declspec(dllexport) DWORD WINAPI GetFileVersionInfoSizeW(LPCWSTR a,LPDWORD b)           {return 0;}
-__declspec(dllexport) BOOL  WINAPI VerQueryValueA(LPCVOID a,LPCSTR b,LPVOID*c,PUINT d)    {return 0;}
-__declspec(dllexport) BOOL  WINAPI VerQueryValueW(LPCVOID a,LPCWSTR b,LPVOID*c,PUINT d)   {return 0;}

@@ -12,6 +12,7 @@ Pipeline:
 import subprocess
 import os
 import shutil
+import stat
 import sys
 
 PROJECT = os.path.dirname(os.path.abspath(__file__))
@@ -30,12 +31,32 @@ def run(cmd, desc):
         sys.exit(1)
 
 
+def _rmtree_force(path):
+    """Remove a directory tree, clearing read-only bits first (Windows).
+
+    `shutil.rmtree(ignore_errors=True)` silently leaves behind dirs containing
+    read-only files (e.g. Nuitka-copied Injector_logo.png), which then breaks
+    the later `os.rename(run.dist -> ElushaInjector)` with WinError 183.
+    """
+    if not os.path.isdir(path):
+        return
+
+    def onerror(func, p, exc):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except Exception:
+            pass
+
+    shutil.rmtree(path, onerror=onerror)
+
+
 def main():
     # Clean previous outputs
     for d in ["build", "dist"]:
         p = os.path.join(PROJECT, d)
         if os.path.isdir(p):
-            shutil.rmtree(p, ignore_errors=True)
+            _rmtree_force(p)
 
     # ── Step 1: UninstallElusha.exe (standalone, ~8 MB) ──
     os.makedirs(TMP, exist_ok=True)
@@ -72,7 +93,7 @@ def main():
         sys.exit(1)
     # Remove previous build if it exists
     if os.path.isdir(injector_dist):
-        shutil.rmtree(injector_dist, ignore_errors=True)
+        _rmtree_force(injector_dist)
     os.rename(run_dist, injector_dist)
 
     # Merge UninstallElusha + its Tcl/Tk runtime into ElushaInjector/
@@ -107,16 +128,16 @@ def main():
         "Step 3/3  Build ElushaInstaller (PyInstaller onefile)")
 
     # ── Cleanup ──
-    shutil.rmtree(TMP, ignore_errors=True)
+    _rmtree_force(TMP)
     # Remove Nuitka build dirs that linger in dist/
     for name in os.listdir(DIST):
         if name.endswith(".build"):
-            shutil.rmtree(os.path.join(DIST, name), ignore_errors=True)
+            _rmtree_force(os.path.join(DIST, name))
     # Remove PyInstaller build artifacts and auto-generated spec
     for p in [os.path.join(PROJECT, "build"),
               os.path.join(PROJECT, "ElushaInstaller.spec")]:
         if os.path.isdir(p):
-            shutil.rmtree(p, ignore_errors=True)
+            _rmtree_force(p)
         elif os.path.isfile(p):
             os.remove(p)
 

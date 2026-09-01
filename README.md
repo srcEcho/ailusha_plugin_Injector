@@ -38,7 +38,7 @@
 - 保留已下载的插件（保留 `elsmod_data/`）
 - 保留已加载的插件（保留 `www/js/plugins/`）
 
-卸载器会删除所有注入器文件（EXE、DLL、pyd、运行库目录）、`version.dll`、`ElushaInstaller.exe` 及 bootstrap 文件。采用三层清理（Manifest → 模式匹配 → 批处理），自身进程锁定的文件通过延迟批处理在退出后循环删除。
+卸载器会删除所有注入器文件（EXE、DLL、pyd、运行库目录）、`winhttp.dll`（旧版残留的 `version.dll` 一并删除）、`ElushaInstaller.exe` 及 bootstrap 文件。采用三层清理（Manifest → 模式匹配 → 批处理），自身进程锁定的文件通过延迟批处理在退出后循环删除。
 
 ---
 
@@ -143,7 +143,7 @@ ElushaInjector.exe --dev
 └──────────┬───────────────────┘
            │ 同步 enabled_plugins.txt + registry.json
 ┌──────────▼───────────────────┐
-│  version.dll (C)             │  ← 注入核心
+│  winhttp.dll (C)             │  ← 注入核心
 │  MinHook: CreateFileW 重定向  │
 │  Bootstrap: fs+eval 加载插件  │
 └──────────────────────────────┘
@@ -153,8 +153,8 @@ ElushaInjector.exe --dev
 
 ```
 Game.exe 启动
-  → Enigma 加载 version.dll
-  → DllMain: MinHook Hook CreateFileW + ReadFile
+  → Enigma 加载 winhttp.dll
+  → DllMain: 转发全部 WinHTTP 导出 + MinHook Hook CreateFileW + ReadFile
   → 读取 elsmod_data/injector_config.json
   → CreateFileW 重定向：目标 JS → Bootstrap
   → Bootstrap 执行:
@@ -164,10 +164,11 @@ Game.exe 启动
 
 ### 关键设计决策
 
-- **version.dll 不代理 version API**：导出返回 0。不需要版本信息，避免残留进程
+- **winhttp.dll 侧载而非 version.dll**：MTOOL 的 Lazy Inject 会删除/覆盖 `version.dll` 与 `winmm.dll`（自用侧载），`winhttp.dll` 是游戏静态导入的第 3 个非 KnownDLL、MTOOL 不碰
+- **转发全部 27 个 WinHTTP 导出**：`nw.dll` 延迟加载 `WinHttpGetProxyForUrl` 等函数，漏转发会 exit 127 无法启动
 - **Bootstrap = CreateFileW 重定向 + fs+eval**：小型加载器（<250B）替换目标 JS，原版放 `originals/` 备份
 - **MinHook 永久 trampoline**：消除 P5/U5 与 Enigma Hook 的竞态，100% 可靠
-- **ShellExecuteW 显式 lpDirectory**：替代 `os.startfile()`，确保游戏进程 CWD 正确——Bootstrap 依赖 `process.cwd()`
+- **Bootstrap 路径用 `p.dirname(process.execPath)`**：不依赖 `process.cwd()`，第三方启动器任意 CWD 拉起都能正确解析
 - **三层卸载清理**：Manifest 精确删除 + 模式匹配兜底 + 批处理清理进程锁定文件
 - **Nuitka standalone** 编译游戏目录组件（避开 EnigmaVB 对 PyInstaller bootloader 的检测）
 - **PyInstaller onefile** 打包安装器（成熟稳定，不接触游戏进程）
@@ -194,7 +195,7 @@ Game.exe 启动
 ├── PySide6/ shiboken6/          ← Qt 库目录
 ├── tcl/ tk/ tcl8/               ← Tcl/Tk 运行时（卸载器依赖）
 ├── injector/                    ← 嵌入资源（图标等）
-├── version.dll                  ← 注入 DLL（MinHook）
+├── winhttp.dll                  ← 注入 DLL（MinHook）
 ├── elsmod_data/                 ← 插件存储 + 注册表 + 配置 + 日志
 │   ├── registry.json            ← 注册表
 │   ├── injector_config.json     ← 注入策略配置
@@ -206,17 +207,18 @@ Game.exe 启动
 ```
 > Nuitka 采用 flat 布局（所有 DLL/pyd 与 EXE 同级），区别于 PyInstaller 的 `_internal/` 集中模式。
 
-### 编译 version.dll
+### 编译 winhttp.dll
 
 ```bash
-mkdir -p /c/tmp/mh_build/hde
+mkdir -p /c/tmp/mh_build/hde /c/tmp/include
 cp src/minhook/*.h /c/tmp/mh_build/
+cp src/minhook/MinHook.h /c/tmp/include/MinHook.h   # hook.c 引用 ../include/MinHook.h
 cp src/minhook/*.c /c/tmp/mh_build/
 cp src/minhook/hde32.c src/minhook/hde32.h src/minhook/pstdint.h src/minhook/table32.h /c/tmp/mh_build/hde/
-cp src/mainline/version_proxy_v54_production.c /c/tmp/mh_build/v54.c
+cp src/mainline/version_proxy_v55_winhttp.c /c/tmp/mh_build/v55.c
 /c/Programs/msys64/msys2_shell.cmd -mingw32 -defterm -no-start -c \
-  'cd /c/tmp/mh_build && gcc -shared -s -Os -static -Wl,--kill-at -I. -Ihde -o v54.dll v54.c buffer.c hook.c trampoline.c hde/hde32.c -lkernel32'
-cp /c/tmp/mh_build/v54.dll 游戏目录/version.dll
+  'cd /c/tmp/mh_build && gcc -shared -s -Os -static -Wl,--kill-at -I. -Ihde -o winhttp.dll v55.c buffer.c hook.c trampoline.c hde/hde32.c -lkernel32'
+cp /c/tmp/mh_build/winhttp.dll 游戏目录/winhttp.dll
 ```
 
 必须通过 MSYS2 MinGW 32-bit shell 编译。

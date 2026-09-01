@@ -434,13 +434,17 @@ def uninstall(keep_elsmod_data: bool, keep_plugins: bool):
                         except OSError:
                             pass
 
-    # ── Delete version.dll (injector payload) ──
-    dll = os.path.join(GAME_DIR, "version.dll")
-    if os.path.isfile(dll):
-        try:
-            os.remove(dll)
-        except OSError:
-            pass
+    # ── Delete winhttp.dll (current injector payload) ──
+    # The deploy step sets the hook DLL read-only, so clear that bit before removing.
+    for _dll_name in ("winhttp.dll", "version.dll"):  # version.dll = legacy installs
+        _dll = os.path.join(GAME_DIR, _dll_name)
+        if os.path.isfile(_dll):
+            try:
+                import stat
+                os.chmod(_dll, os.stat(_dll).st_mode | stat.S_IWRITE)
+                os.remove(_dll)
+            except OSError:
+                pass
 
     # ── Restore original plugins.js for unpacked mode ──
     _restore_plugins_js()

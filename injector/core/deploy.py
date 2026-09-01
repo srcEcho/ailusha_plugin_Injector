@@ -31,52 +31,93 @@ REQUIRED_DIRS = [
     "elsmod_data/bootstraps",
 ]
 
-BOOTSTRAP_TEMPLATE = """(function(){{var f=require('fs'),p=require('path'),b=process.cwd();
-try{{eval(f.readFileSync(p.join(b,'elsmod_data/originals/www/js/plugins/{original}'),'utf8'));}}catch(e){{}}
-{loaders}
-}})();"""
+# Bootstrap loader (written to EventInformation_bootstrap.js). Runs in the game's
+# renderer process. Every stage — bootstrap entry, original eval, each plugin
+# eval, and completion — is logged to elsmod_data/logs/bootstrap.log so the full
+# DLL → redirect → bootstrap → plugin chain can be verified end-to-end (including
+# under third-party launchers like MTOOL). Uses __ORIGINAL__ / __LOADERS__ markers
+# and .replace() (not str.format) so the JS braces stay literal.
+BOOTSTRAP_TEMPLATE = """(function(){
+try{
+var f=require('fs'),p=require('path'),b=p.dirname(process.execPath);
+var _logdir=p.join(b,'elsmod_data','logs');
+var _logf=p.join(_logdir,'bootstrap.log');
+function L(m){try{f.appendFileSync(_logf,'['+new Date().toISOString()+'] [pid='+process.pid+'] '+m+'\\n');}catch(e){}}
+L('BOOTSTRAP_START original=__ORIGINAL__ cwd='+process.cwd()+' exe='+process.execPath);
+try{eval(f.readFileSync(p.join(b,'elsmod_data/originals/www/js/plugins/__ORIGINAL__'),'utf8'));L('ORIGINAL_EVAL_OK __ORIGINAL__');}catch(e){L('ORIGINAL_EVAL_FAIL __ORIGINAL__ '+e);}
+__LOADERS__
+L('BOOTSTRAP_END');
+}catch(e){try{var _f2=require('fs'),_p2=require('path');_f2.appendFileSync(_p2.join(_p2.dirname(process.execPath),'elsmod_data','logs','bootstrap.log'),'[BOOTSTRAP_FATAL] '+e+'\\n');}catch(x){}}
+})();"""
 
-PLUGIN_LOADER = "try{{eval(f.readFileSync(p.join(b,'{path}'),'utf8'));}}catch(e){{}}\n"
+PLUGIN_LOADER = "try{eval(f.readFileSync(p.join(b,'__PATH__'),'utf8'));L('PLUGIN_EVAL_OK __PATH__');}catch(e){L('PLUGIN_EVAL_FAIL __PATH__ '+e);}\n"
 
 EMBEDDED_FILES_PACKED = ["UninstallElusha.exe"]
 EMBEDDED_FILES_UNPACKED = ["UninstallElusha.exe"]
 
 
-def _extract_dll(game_dir: str) -> bool:
-    """Extract version.dll from embedded base64 data.
-    Respects injector_config.json for hook_library selection.
-    Returns True on success."""
-    dll_path = os.path.join(game_dir, "version.dll")
+def _set_readonly(path: str, readonly: bool) -> None:
+    """Set/clear the read-only attribute on a file.
 
-    # Read config to determine which DLL variant to deploy
+    version.dll is set read-only so that third-party launchers like MTOOL —
+    whose `从游戏中移除工具文件.bat` runs `del /Q version.dll` — cannot delete
+    the side-loaded injection DLL. `del /Q` (without `/F`) refuses read-only
+    files and the error is swallowed by `2>nul`, so the game still boots with
+    our hook intact.
+    """
     try:
-        from . import injector_config
-        cfg = injector_config.load(game_dir)
-        hook_lib = cfg.get("hook_library", "minhook")
-    except Exception:
-        hook_lib = "minhook"
+        import stat
+        mode = os.stat(path).st_mode
+        if readonly:
+            os.chmod(path, mode & ~stat.S_IWRITE)
+        else:
+            os.chmod(path, mode | stat.S_IWRITE)
+    except OSError:
+        pass
 
-    # Build a version marker to detect config changes
+
+def _extract_dll(game_dir: str) -> bool:
+    """Extract winhttp.dll from embedded base64 data.
+
+    We side-load **winhttp.dll** instead of version.dll. Third-party launchers
+    (MTOOL) delete/overwrite version.dll *and* winmm.dll for their own lazy-inject,
+    so our version.dll is removed and the hook never fires. The game's unpacked main
+    exe also statically imports winhttp.dll (a DLL MTOOL does not manage), and our
+    build forwards every WinHTTP export to the real System32 winhttp.dll, so the
+    game's networking is unchanged.
+    Returns True on success."""
+    dll_path = os.path.join(game_dir, "winhttp.dll")
+
+    # Marker to detect config changes (single minhook variant for winhttp).
     marker_path = os.path.join(game_dir, "elsmod_data", ".dll_version")
-    current_marker = f"v={hook_lib}"
+    current_marker = "v=winhttp:1"  # bump to force re-extract of an updated DLL
     if os.path.exists(dll_path) and os.path.exists(marker_path):
         try:
             with open(marker_path, "r") as f:
                 if f.read().strip() == current_marker:
-                    return True  # Already present with correct variant
+                    _set_readonly(dll_path, True)
+                    return True
         except Exception:
             pass
 
-    # Extract the correct DLL variant
+    # Remove any stale version.dll from older installs so we don't double-hook.
+    stale = os.path.join(game_dir, "version.dll")
+    if os.path.exists(stale):
+        try:
+            _set_readonly(stale, False)
+            os.remove(stale)
+        except OSError:
+            pass
+
     try:
         import base64
         from . import _dll_data
-        if hook_lib == "p5u5":
-            data = base64.b64decode("".join(_dll_data.VERSION_DLL_V46_B64))
-        else:
-            data = base64.b64decode("".join(_dll_data.VERSION_DLL_B64))
+        data = base64.b64decode("".join(_dll_data.WINHTTP_DLL_B64))
+        if os.path.exists(dll_path):
+            _set_readonly(dll_path, False)
         with open(dll_path, "wb") as f:
             f.write(data)
+        _set_readonly(dll_path, True)
         with open(marker_path, "w") as f:
             f.write(current_marker)
         return True
@@ -252,9 +293,9 @@ def _generate_bootstraps(game_dir: str, config: dict, plugin_files: dict[str, st
         loaders = ""
         for pname in plugins:
             path = plugin_files.get(pname, f"www/js/plugins/{pname}.js")
-            loaders += PLUGIN_LOADER.format(path=path)
+            loaders += PLUGIN_LOADER.replace("__PATH__", path)
 
-        bootstrap_js = BOOTSTRAP_TEMPLATE.format(original=original, loaders=loaders)
+        bootstrap_js = BOOTSTRAP_TEMPLATE.replace("__ORIGINAL__", original).replace("__LOADERS__", loaders)
 
         dest = os.path.join(game_dir, "www/js/plugins", source_name)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -289,15 +330,15 @@ def setup(game_dir: str) -> dict:
     # Create directories
     result["dirs_created"] = ensure_directories(game_dir)
 
-    # Extract version.dll from embedded base64 (packed mode only)
+    # Extract winhttp.dll from embedded base64 (packed mode only)
     if mode == "packed":
-        _dlog("setup: packed mode — extracting version.dll")
+        _dlog("setup: packed mode — extracting winhttp.dll")
         if _extract_dll(game_dir):
-            _dlog("setup: version.dll extracted OK")
-            result["files_extracted"].append(os.path.join(game_dir, "version.dll"))
+            _dlog("setup: winhttp.dll extracted OK")
+            result["files_extracted"].append(os.path.join(game_dir, "winhttp.dll"))
         else:
-            _dlog("setup: version.dll extraction FAILED")
-            result["errors"].append("无法解出版本 DLL")
+            _dlog("setup: winhttp.dll extraction FAILED")
+            result["errors"].append("无法解出钩子 DLL")
 
         # Generate bootstrap files for bootstrap mode
         _dlog("setup: generating bootstraps...")
