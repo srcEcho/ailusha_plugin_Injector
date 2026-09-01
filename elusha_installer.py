@@ -277,28 +277,25 @@ class WelcomePage(WizardPage):
         self._build()
 
     def _build(self):
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=0)
-        self.grid_rowconfigure(2, weight=0)
-        self.grid_rowconfigure(3, weight=0)
-        self.grid_rowconfigure(4, weight=1)
         self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)  # flexible spacer
 
         self._title = ttk.Label(self, style="Title.TLabel")
-        self._title.grid(row=1, column=0, pady=(0, 16))
+        self._title.grid(row=0, column=0, pady=(0, 16), sticky="n")
 
         self._subtitle = ttk.Label(self, style="Body.TLabel",
                                    wraplength=460, justify=tk.CENTER)
-        self._subtitle.grid(row=2, column=0, pady=(0, 32))
+        self._subtitle.grid(row=1, column=0, pady=(0, 24), sticky="n")
 
-        btn_frame = ttk.Frame(self)
-        btn_frame.grid(row=3, column=0)
-        self._start_btn = ttk.Button(btn_frame, style="Accent.TButton",
-                                     command=self._on_start)
-        self._start_btn.pack(side=tk.LEFT, padx=8)
-        self._exit_btn = ttk.Button(btn_frame, style="Secondary.TButton",
+        # Nav buttons — secondary left, accent right, pinned at bottom
+        nav_frame = ttk.Frame(self)
+        nav_frame.grid(row=3, column=0, sticky="n", pady=(24, 0))
+        self._exit_btn = ttk.Button(nav_frame, style="Secondary.TButton",
                                     command=self._on_exit)
         self._exit_btn.pack(side=tk.LEFT, padx=8)
+        self._start_btn = ttk.Button(nav_frame, style="Accent.TButton",
+                                     command=self._on_start)
+        self._start_btn.pack(side=tk.LEFT, padx=8)
 
         self._refresh_text()
 
@@ -334,12 +331,11 @@ class SelectExePage(WizardPage):
                 w.destroy()
         self._built = True
 
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_rowconfigure(5, weight=1)
         self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(3, weight=1)  # flexible spacer
 
         self._title = ttk.Label(self, style="Heading.TLabel")
-        self._title.grid(row=0, column=0, pady=(0, 12), sticky="n")
+        self._title.grid(row=0, column=0, pady=(0, 16), sticky="n")
 
         self._prompt = ttk.Label(self, style="Body.TLabel",
                                  wraplength=460)
@@ -358,20 +354,9 @@ class SelectExePage(WizardPage):
                                       command=self._on_browse)
         self._browse_btn.grid(row=0, column=1)
 
-        # Target dir row
-        dir_frame = ttk.Frame(self)
-        dir_frame.grid(row=3, column=0, sticky="ew", pady=(0, 24))
-        dir_frame.grid_columnconfigure(1, weight=1)
-
-        self._dir_label = ttk.Label(dir_frame, style="Body.TLabel")
-        self._dir_label.grid(row=0, column=0, sticky="w")
-        self._dir_value = ttk.Label(dir_frame, style="Body.TLabel",
-                                    foreground="#5599cc", wraplength=400)
-        self._dir_value.grid(row=0, column=1, sticky="w", padx=(4, 0))
-
-        # Nav buttons
+        # Nav buttons — secondary left, accent right, pinned at bottom
         nav_frame = ttk.Frame(self)
-        nav_frame.grid(row=4, column=0, sticky="n")
+        nav_frame.grid(row=4, column=0, sticky="n", pady=(24, 0))
         self._back_btn = ttk.Button(nav_frame, style="Secondary.TButton",
                                     command=lambda: self.wizard.show_page("welcome"))
         self._back_btn.pack(side=tk.LEFT, padx=8)
@@ -385,7 +370,6 @@ class SelectExePage(WizardPage):
     def _refresh_text(self):
         self._title.configure(text=self.tr("select.title"))
         self._prompt.configure(text=self.tr("select.prompt"))
-        self._dir_label.configure(text=self.tr("select.target_dir"))
         self._browse_btn.configure(text=self.tr("select.browse"))
         self._back_btn.configure(text=self.tr("select.back"))
         self._next_btn.configure(text=self.tr("select.next"))
@@ -407,11 +391,12 @@ class SelectExePage(WizardPage):
     def _update_state(self):
         if self.s.get("exe_path"):
             self._path_var.set(self.s["exe_path"])
-            self._dir_value.configure(text=self.s["game_dir"])
             self._next_btn.configure(state=tk.NORMAL)
+            # Reveal the tail of long paths (the file / folder name)
+            self._path_entry.after_idle(
+                lambda: self._path_entry.xview_moveto(1.0))
         else:
             self._path_var.set(self.tr("select.no_file"))
-            self._dir_value.configure(text="—")
             self._next_btn.configure(state=tk.DISABLED)
 
     def on_enter(self):
@@ -442,12 +427,11 @@ class ConfirmPage(WizardPage):
                 w.destroy()
         self._built = True
 
-        self.grid_rowconfigure(0, weight=0)
-        self.grid_rowconfigure(7, weight=1)
         self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(6, weight=1)  # flexible spacer
 
         self._title = ttk.Label(self, style="Heading.TLabel")
-        self._title.grid(row=0, column=0, pady=(0, 4), sticky="n")
+        self._title.grid(row=0, column=0, pady=(0, 16), sticky="n")
 
         self._summary = ttk.Label(self, style="Body.TLabel",
                                   foreground="gray")
@@ -456,25 +440,27 @@ class ConfirmPage(WizardPage):
         sep = ttk.Separator(self, orient="horizontal")
         sep.grid(row=2, column=0, sticky="ew", pady=(0, 12))
 
-        # Info rows
-        self._rows = []
-        for _ in range(5):
+        # Info rows — rows 3..4: exe path and install dir as readonly
+        # Entries so long paths are still selectable.
+        self._rows = []  # (label_w, value_w, path_var)
+        for i in range(2):
             frame = ttk.Frame(self)
-            frame.grid(sticky="ew", pady=2)
+            frame.grid(row=3 + i, column=0, sticky="ew", pady=2)
             frame.grid_columnconfigure(1, weight=1)
             lbl = ttk.Label(frame, style="Body.TLabel")
             lbl.grid(row=0, column=0, sticky="w")
-            val = ttk.Label(frame, style="Body.TLabel",
-                            foreground="#aaaaaa", wraplength=440)
-            val.grid(row=0, column=1, sticky="w", padx=(8, 0))
-            self._rows.append((lbl, val, frame))
+            var = tk.StringVar()
+            val = ttk.Entry(frame, textvariable=var, state="readonly")
+            val.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+            self._rows.append((lbl, val, var))
 
         self._warning = ttk.Label(self, style="Warning.TLabel",
                                   wraplength=460)
-        self._warning.grid(row=4, column=0, sticky="n", pady=(12, 0))
+        self._warning.grid(row=5, column=0, sticky="n", pady=(12, 0))
 
+        # Nav buttons — secondary left, accent right, pinned at bottom
         nav_frame = ttk.Frame(self)
-        nav_frame.grid(row=6, column=0, sticky="n", pady=(24, 0))
+        nav_frame.grid(row=7, column=0, sticky="n", pady=(24, 0))
         self._back_btn = ttk.Button(nav_frame, style="Secondary.TButton",
                                     command=lambda: self.wizard.show_page("select"))
         self._back_btn.pack(side=tk.LEFT, padx=8)
@@ -505,13 +491,12 @@ class ConfirmPage(WizardPage):
         rows_data = [
             (self.tr("confirm.game_exe"), exe_path),
             (self.tr("confirm.install_dir"), game_dir),
-            ("", ""),
-            (self.tr("confirm.will_install"), ""),
-            ("", f"  • {self.tr('confirm.item_exe')}\n  • {self.tr('confirm.item_internal')}"),
         ]
-        for (lbl, val), (label_w, value_w, _) in zip(rows_data, self._rows):
+        for (lbl, val), (label_w, value_w, path_var) in zip(rows_data, self._rows):
             label_w.configure(text=lbl)
-            value_w.configure(text=val)
+            path_var.set(val)
+            # Reveal the tail of long paths (the file / folder name)
+            value_w.after_idle(lambda e=value_w: e.xview_moveto(1.0))
 
         # Existing-install warning
         existing = os.path.join(game_dir, "ElushaInjector.exe") if game_dir else ""
@@ -537,26 +522,22 @@ class ProgressPage(WizardPage):
             for w in self.winfo_children():
                 w.destroy()
         self._built = True
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=0)
-        self.grid_rowconfigure(2, weight=0)
-        self.grid_rowconfigure(3, weight=0)
-        self.grid_rowconfigure(4, weight=1)
         self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(4, weight=1)  # bottom flexible spacer
 
         self._title = ttk.Label(self, style="Heading.TLabel")
-        self._title.grid(row=1, column=0, pady=(0, 20))
+        self._title.grid(row=0, column=0, pady=(0, 16), sticky="n")
 
         self._bar = ttk.Progressbar(self, mode="determinate", length=440)
-        self._bar.grid(row=2, column=0, pady=(0, 12))
+        self._bar.grid(row=1, column=0, pady=(0, 12))
 
         self._status = ttk.Label(self, style="Body.TLabel",
-                                 wraplength=440)
-        self._status.grid(row=3, column=0)
+                                 wraplength=460)
+        self._status.grid(row=2, column=0)
 
         self._please = ttk.Label(self, style="Subtitle.TLabel",
-                                 wraplength=440)
-        self._please.grid(row=4, column=0, pady=(4, 0))
+                                 wraplength=460)
+        self._please.grid(row=3, column=0, pady=(4, 0))
 
         self._refresh_text()
 
@@ -599,35 +580,29 @@ class DonePage(WizardPage):
                 w.destroy()
         self._built = True
 
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=0)
-        self.grid_rowconfigure(2, weight=0)
-        self.grid_rowconfigure(3, weight=0)
-        self.grid_rowconfigure(4, weight=0)
-        self.grid_rowconfigure(5, weight=1)
         self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(3, weight=1)  # flexible spacer
 
         self._title_lbl = ttk.Label(self, style="Heading.TLabel")
-        self._title_lbl.grid(row=1, column=0, pady=(0, 16))
+        self._title_lbl.grid(row=0, column=0, pady=(0, 16), sticky="n")
 
         self._msg_lbl = ttk.Label(self, style="Body.TLabel",
-                                  wraplength=440, justify=tk.CENTER)
-        self._msg_lbl.grid(row=2, column=0, pady=(0, 24))
+                                  wraplength=460, justify=tk.CENTER)
+        self._msg_lbl.grid(row=1, column=0, pady=(0, 24), sticky="n")
 
         self._del_var = tk.BooleanVar(value=False)
         self._del_cb = ttk.Checkbutton(self, variable=self._del_var)
-        self._del_cb.grid(row=3, column=0, pady=(0, 16))
+        self._del_cb.grid(row=2, column=0, pady=(0, 16))
 
-        btn_frame = ttk.Frame(self)
-        btn_frame.grid(row=4, column=0)
-        btn_frame.grid_columnconfigure(0, weight=1)
-        btn_frame.grid_columnconfigure(1, weight=1)
-        self._open_btn = ttk.Button(btn_frame, style="Secondary.TButton",
+        # Nav buttons — secondary left, accent right, pinned at bottom
+        nav_frame = ttk.Frame(self)
+        nav_frame.grid(row=4, column=0, sticky="n", pady=(24, 0))
+        self._open_btn = ttk.Button(nav_frame, style="Secondary.TButton",
                                     command=self._on_open_dir)
-        self._open_btn.grid(row=0, column=0, padx=8, sticky="e")
-        self._finish_btn = ttk.Button(btn_frame, style="Accent.TButton",
+        self._open_btn.pack(side=tk.LEFT, padx=8)
+        self._finish_btn = ttk.Button(nav_frame, style="Accent.TButton",
                                       command=self._on_finish)
-        self._finish_btn.grid(row=0, column=1, padx=8, sticky="w")
+        self._finish_btn.pack(side=tk.LEFT, padx=8)
 
     def translate(self, new_lang):
         self._build()
@@ -638,14 +613,14 @@ class DonePage(WizardPage):
             self._title_lbl.configure(text=self.tr("done.error_title"))
             self._msg_lbl.configure(text=error)
             self._del_cb.grid_remove()
-            self._open_btn.grid_remove()
+            self._open_btn.pack_forget()
         else:
             self._title_lbl.configure(text=self.tr("done.success_title"))
             self._msg_lbl.configure(text=self.tr("done.success_msg"))
             self._del_cb.configure(text=self.tr("done.delete_self"))
             self._del_cb.grid()
             self._open_btn.configure(text=self.tr("done.open_dir"))
-            self._open_btn.grid()
+            self._open_btn.pack(side=tk.LEFT, padx=8)
         self._finish_btn.configure(text=self.tr("done.finish"))
 
     def _on_open_dir(self):
@@ -682,8 +657,8 @@ class InstallerWizard(tk.Tk):
 
         # Window config
         self.title(tr(self.state["lang"], "wizard.title"))
-        self.minsize(540, 460)
-        self.geometry("540x500")
+        self.minsize(400, 200)
+        self.geometry("500x450")
         self.resizable(True, True)
 
         # Icon
